@@ -1,3 +1,4 @@
+mod decorations;
 mod layer;
 mod minimap;
 

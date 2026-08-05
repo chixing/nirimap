@@ -20,6 +20,10 @@ pub struct Window {
     pub is_focused: bool,
     /// Whether this window is floating (not tiled)
     pub is_floating: bool,
+    /// Window title, if set
+    pub title: Option<String>,
+    /// Application ID (Wayland app-id), if set
+    pub app_id: Option<String>,
 }
 
 /// Represents a workspace containing windows
@@ -196,6 +200,8 @@ mod tests {
             window_index: 0,
             is_focused: false,
             is_floating: false,
+            title: None,
+            app_id: None,
         }
     }
 

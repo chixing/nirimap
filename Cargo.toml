@@ -13,6 +13,7 @@ niri-ipc = "26"
 # GTK4 and Layer Shell
 gtk4 = "0.11"
 gtk4-layer-shell = "0.8"
+pangocairo = "0.22"
 
 # Async runtime for IPC
 tokio = { version = "1", features = ["rt", "net", "sync", "io-util"] }

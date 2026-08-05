@@ -22,7 +22,8 @@ src/
 └── ui/
     ├── mod.rs        # Module exports
     ├── layer.rs      # GTK4 layer-shell window setup
-    └── minimap.rs    # Cairo drawing and widget logic
+    ├── minimap.rs    # Cairo drawing and widget logic
+    └── decorations.rs # Window labels (PangoCairo) and app icons (IconTheme + cache)
 ```
 
 ## Key Technical Details
