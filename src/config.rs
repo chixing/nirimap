@@ -114,6 +114,152 @@ impl Default for AppearanceConfig {
     }
 }
 
+/// What text a window label shows
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LabelContent {
+    /// Window title
+    #[default]
+    Title,
+    /// Application ID
+    AppId,
+    /// Application ID and title, e.g. "firefox — GitHub"
+    AppIdTitle,
+    /// No text (labels effectively disabled)
+    None,
+}
+
+/// Font weight for labels
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FontWeight {
+    #[default]
+    Normal,
+    Bold,
+}
+
+/// Font style for labels
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FontStyle {
+    #[default]
+    Normal,
+    Italic,
+}
+
+/// Icon size: fixed pixel size or scaled from the window rectangle
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub enum IconSize {
+    /// Scale with the window rectangle
+    #[default]
+    Auto,
+    /// Explicit pixel size
+    Pixels(f64),
+}
+
+impl<'de> serde::Deserialize<'de> for IconSize {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Text(String),
+            Number(f64),
+        }
+
+        match Raw::deserialize(deserializer)? {
+            Raw::Text(s) if s == "auto" => Ok(IconSize::Auto),
+            Raw::Text(s) => Err(serde::de::Error::custom(format!(
+                "invalid icon size \"{}\": expected \"auto\" or a number",
+                s
+            ))),
+            Raw::Number(n) => Ok(IconSize::Pixels(n)),
+        }
+    }
+}
+
+/// Window label configuration
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LabelConfig {
+    /// Draw text labels on window rectangles
+    pub enabled: bool,
+    /// What the label shows
+    pub content: LabelContent,
+    /// Font family name
+    pub font_family: String,
+    /// Font size in pixels
+    pub font_size: f64,
+    /// Font weight
+    pub font_weight: FontWeight,
+    /// Font style
+    pub font_style: FontStyle,
+    /// Text color (hex)
+    pub color: String,
+    /// Text color on the focused window (hex)
+    pub focused_color: String,
+    /// Anchor position within the window rectangle
+    pub position: Anchor,
+    /// Inner padding between label and window edge
+    pub padding: f64,
+    /// Skip labels on windows whose rectangle is smaller than this (minimap pixels)
+    pub min_window_size: f64,
+    /// Draw a dark drop shadow behind the text for legibility
+    pub shadow: bool,
+}
+
+impl Default for LabelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            content: LabelContent::Title,
+            font_family: "Sans".to_string(),
+            font_size: 10.0,
+            font_weight: FontWeight::Normal,
+            font_style: FontStyle::Normal,
+            color: "#cdd6f4".to_string(),
+            focused_color: "#1e1e2e".to_string(),
+            position: Anchor::Center,
+            padding: 2.0,
+            min_window_size: 30.0,
+            shadow: false,
+        }
+    }
+}
+
+/// Application icon configuration
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct IconConfig {
+    /// Draw application icons on window rectangles
+    pub enabled: bool,
+    /// Icon size: "auto" (scales with the window rectangle) or explicit pixels
+    pub size: IconSize,
+    /// Anchor position within the window rectangle
+    pub position: Anchor,
+    /// Icon opacity (0.0 - 1.0)
+    pub opacity: f64,
+    /// GTK icon theme name to use instead of the system default
+    pub theme_override: Option<String>,
+    /// Skip icons on windows whose rectangle is smaller than this (minimap pixels)
+    pub min_window_size: f64,
+}
+
+impl Default for IconConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            size: IconSize::Auto,
+            position: Anchor::Center,
+            opacity: 1.0,
+            theme_override: None,
+            min_window_size: 16.0,
+        }
+    }
+}
+
 /// Behavior configuration
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -148,6 +294,8 @@ impl Default for BehaviorConfig {
 pub struct Config {
     pub display: DisplayConfig,
     pub appearance: AppearanceConfig,
+    pub labels: LabelConfig,
+    pub icons: IconConfig,
     pub behavior: BehaviorConfig,
 }
 
@@ -191,7 +339,18 @@ impl Config {
             })?;
         }
 
-        let default_config = r##"[display]
+        let default_config = DEFAULT_CONFIG_TOML;
+        std::fs::write(&config_path, default_config).with_context(|| {
+            format!("Failed to write default config: {}", config_path.display())
+        })?;
+
+        tracing::info!("Created default config at {}", config_path.display());
+        Ok(())
+    }
+}
+
+/// The default config file contents, written on first run.
+const DEFAULT_CONFIG_TOML: &str = r##"[display]
 height = 100              # Per-workspace row height in pixels
                           # In "current" mode: total widget height
                           # In "all" mode: height of one workspace row
@@ -221,6 +380,29 @@ workspace_gap = 4                            # Vertical gap between stacked work
 active_workspace_border_color = "#89b4fa"    # Highlight border for active workspace ("all" mode)
 active_workspace_border_width = 2            # Highlight border thickness ("all" mode)
 
+[labels]
+enabled = false           # Draw text labels on window rectangles
+content = "title"         # What to show: "title", "app-id", "app-id-title", "none"
+font_family = "Sans"      # Font family name
+font_size = 10            # Font size in pixels
+font_weight = "normal"    # "normal" or "bold"
+font_style = "normal"     # "normal" or "italic"
+color = "#cdd6f4"         # Text color
+focused_color = "#1e1e2e" # Text color on the focused window
+position = "center"       # Anchor within the window rectangle: center, top-left,
+                          # top-center, top-right, bottom-left, bottom-center, bottom-right
+padding = 2               # Inner padding between label and window edge
+min_window_size = 30      # Skip labels on rectangles smaller than this (minimap pixels)
+shadow = false            # Dark drop shadow behind text for legibility
+
+[icons]
+enabled = true            # Draw application icons on window rectangles
+size = "auto"             # "auto" (scales with the rectangle) or explicit pixels, e.g. 16
+position = "center"       # Anchor within the window rectangle (same options as labels)
+opacity = 1.0             # Icon opacity (0.0 - 1.0)
+# theme_override = "Papirus" # GTK icon theme name (defaults to system theme)
+min_window_size = 16      # Skip icons on rectangles smaller than this (minimap pixels)
+
 [behavior]
 show_on_overview = true        # Keep visible in Niri overview mode
 always_visible = true          # Always show minimap (false = only on focus change)
@@ -230,15 +412,6 @@ show_for_floating_windows = false # When always_visible = false, surface the min
                                   # floating window spawn). Off by default since floating
                                   # windows aren't drawn on the minimap.
 "##;
-
-        std::fs::write(&config_path, default_config).with_context(|| {
-            format!("Failed to write default config: {}", config_path.display())
-        })?;
-
-        tracing::info!("Created default config at {}", config_path.display());
-        Ok(())
-    }
-}
 
 /// RGBA color representation
 #[derive(Debug, Clone, Copy)]
@@ -303,11 +476,133 @@ mod tests {
         assert_eq!(config.appearance.active_workspace_border_color, "#89b4fa");
         assert_eq!(config.appearance.active_workspace_border_width, 2.0);
 
+        // Test label defaults
+        assert!(!config.labels.enabled);
+        assert_eq!(config.labels.content, LabelContent::Title);
+        assert_eq!(config.labels.font_family, "Sans");
+        assert_eq!(config.labels.font_size, 10.0);
+        assert_eq!(config.labels.font_weight, FontWeight::Normal);
+        assert_eq!(config.labels.font_style, FontStyle::Normal);
+        assert_eq!(config.labels.color, "#cdd6f4");
+        assert_eq!(config.labels.focused_color, "#1e1e2e");
+        assert_eq!(config.labels.position, Anchor::Center);
+        assert_eq!(config.labels.padding, 2.0);
+        assert_eq!(config.labels.min_window_size, 30.0);
+        assert!(!config.labels.shadow);
+
+        // Test icon defaults
+        assert!(config.icons.enabled);
+        assert_eq!(config.icons.size, IconSize::Auto);
+        assert_eq!(config.icons.position, Anchor::Center);
+        assert_eq!(config.icons.opacity, 1.0);
+        assert_eq!(config.icons.theme_override, None);
+        assert_eq!(config.icons.min_window_size, 16.0);
+
         // Test behavior defaults
         assert!(config.behavior.show_on_overview);
         assert!(config.behavior.always_visible);
         assert_eq!(config.behavior.hide_timeout_ms, 2000);
         assert!(!config.behavior.show_for_floating_windows);
+    }
+
+    #[test]
+    fn test_label_config_deserialization() {
+        let toml = r#"
+            [labels]
+            enabled = true
+            content = "app-id-title"
+            font_weight = "bold"
+            font_style = "italic"
+            position = "top-left"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.labels.enabled);
+        assert_eq!(config.labels.content, LabelContent::AppIdTitle);
+        assert_eq!(config.labels.font_weight, FontWeight::Bold);
+        assert_eq!(config.labels.font_style, FontStyle::Italic);
+        assert_eq!(config.labels.position, Anchor::TopLeft);
+        // Unspecified fields keep defaults
+        assert_eq!(config.labels.font_family, "Sans");
+        assert_eq!(config.labels.padding, 2.0);
+    }
+
+    #[test]
+    fn test_label_content_variants() {
+        for (value, expected) in [
+            ("title", LabelContent::Title),
+            ("app-id", LabelContent::AppId),
+            ("app-id-title", LabelContent::AppIdTitle),
+            ("none", LabelContent::None),
+        ] {
+            let toml = format!("[labels]\ncontent = \"{}\"", value);
+            let config: Config = toml::from_str(&toml).unwrap();
+            assert_eq!(config.labels.content, expected);
+        }
+    }
+
+    #[test]
+    fn test_icon_config_deserialization() {
+        let toml = r#"
+            [icons]
+            enabled = false
+            size = 24
+            position = "bottom-right"
+            opacity = 0.5
+            theme_override = "Papirus"
+            min_window_size = 10
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.icons.enabled);
+        assert_eq!(config.icons.size, IconSize::Pixels(24.0));
+        assert_eq!(config.icons.position, Anchor::BottomRight);
+        assert_eq!(config.icons.opacity, 0.5);
+        assert_eq!(config.icons.theme_override.as_deref(), Some("Papirus"));
+        assert_eq!(config.icons.min_window_size, 10.0);
+    }
+
+    #[test]
+    fn test_icon_size_auto_deserialization() {
+        let toml = r#"
+            [icons]
+            size = "auto"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.icons.size, IconSize::Auto);
+    }
+
+    #[test]
+    fn test_icon_size_invalid_string_rejected() {
+        let toml = r#"
+            [icons]
+            size = "huge"
+        "#;
+        assert!(toml::from_str::<Config>(toml).is_err());
+    }
+
+    #[test]
+    fn test_default_config_toml_matches_defaults() {
+        // The default config file we write on first run must parse and agree
+        // with the in-code defaults.
+        let config: Config = toml::from_str(DEFAULT_CONFIG_TOML).unwrap();
+        let defaults = Config::default();
+
+        assert_eq!(config.display.height, defaults.display.height);
+        assert_eq!(config.appearance.background, defaults.appearance.background);
+        assert_eq!(config.labels.enabled, defaults.labels.enabled);
+        assert_eq!(config.labels.content, defaults.labels.content);
+        assert_eq!(config.labels.font_size, defaults.labels.font_size);
+        assert_eq!(
+            config.labels.min_window_size,
+            defaults.labels.min_window_size
+        );
+        assert_eq!(config.icons.enabled, defaults.icons.enabled);
+        assert_eq!(config.icons.size, defaults.icons.size);
+        assert_eq!(config.icons.opacity, defaults.icons.opacity);
+        assert_eq!(config.icons.theme_override, defaults.icons.theme_override);
+        assert_eq!(
+            config.behavior.always_visible,
+            defaults.behavior.always_visible
+        );
     }
 
     #[test]

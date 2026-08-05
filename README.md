@@ -13,6 +13,7 @@ A minimal workspace minimap overlay for the [Niri](https://github.com/YaLTeR/nir
 - Renders as an overlay layer surface (visible over fullscreen windows)
 - Click-through design (doesn't intercept mouse events)
 - Configurable appearance (colors, borders, gaps, opacity)
+- Application icons and text labels on window rectangles (configurable fonts, colors, positions)
 - Configurable visibility behavior (always visible or show on events)
 - Hot-reloads configuration changes
 - Dynamic sizing based on workspace content
@@ -104,6 +105,29 @@ workspace_gap = 4                           # Vertical gap between stacked works
 active_workspace_border_color = "#89b4fa"   # Highlight border for the active workspace ("all" mode)
 active_workspace_border_width = 2           # Highlight border thickness ("all" mode)
 
+[labels]
+enabled = false           # Draw text labels on window rectangles
+content = "title"         # What to show: "title", "app-id", "app-id-title", "none"
+font_family = "Sans"      # Font family name
+font_size = 10            # Font size in pixels
+font_weight = "normal"    # "normal" or "bold"
+font_style = "normal"     # "normal" or "italic"
+color = "#cdd6f4"         # Text color
+focused_color = "#1e1e2e" # Text color on the focused window
+position = "center"       # Anchor within the window rectangle: center, top-left,
+                          # top-center, top-right, bottom-left, bottom-center, bottom-right
+padding = 2               # Inner padding between label and window edge
+min_window_size = 30      # Skip labels on rectangles smaller than this (minimap pixels)
+shadow = false            # Dark drop shadow behind text for legibility
+
+[icons]
+enabled = true            # Draw application icons on window rectangles
+size = "auto"             # "auto" (scales with the rectangle) or explicit pixels, e.g. 16
+position = "center"       # Anchor within the window rectangle (same options as labels)
+opacity = 1.0             # Icon opacity (0.0 - 1.0)
+# theme_override = "Papirus" # GTK icon theme name (defaults to system theme)
+min_window_size = 16      # Skip icons on rectangles smaller than this (minimap pixels)
+
 [behavior]
 show_on_overview = true        # Keep visible in Niri overview mode (not yet implemented)
 always_visible = true          # Always show minimap (false = only on events)
@@ -124,11 +148,20 @@ Two display modes control what the minimap shows:
 
 In `all` mode the total widget height grows with the number of workspaces, capped at `max_height_percent` of the monitor's height. When the cap is hit, per-workspace rows shrink proportionally to fit.
 
+### Window Labels and Icons
+
+Window rectangles can show the application's icon and/or a text label to make windows easier to tell apart at a glance. Icons are enabled by default; labels are opt-in via `labels.enabled = true`.
+
+Icons are resolved from the GTK icon theme by the window's `app_id`. If no themed icon matches, nirimap scans desktop files for a matching `StartupWMClass` or desktop-file name (this is how apps like Electron-based ones usually resolve). As a last resort, the first letter of the `app_id` is drawn in a circle. Set `icons.theme_override` to use a specific icon theme instead of the system default.
+
+Labels are drawn with Pango, so font fallback and non-Latin text work as expected, and text that doesn't fit the rectangle is ellipsized. Both decorations skip rectangles smaller than their `min_window_size` so tiny tiles stay clean.
+
 ### Hot Reload
 
 The configuration file is watched for changes. Most settings will apply immediately without restarting:
 
 - Appearance settings (colors, borders, gaps, opacity)
+- Label and icon settings (including `theme_override`)
 - Behavior settings (visibility, timeout)
 - Display settings (height, max width)
 

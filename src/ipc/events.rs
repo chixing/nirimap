@@ -251,6 +251,8 @@ fn niri_window_to_model(win: &niri_ipc::Window) -> Window {
         window_index,
         is_focused: win.is_focused,
         is_floating,
+        title: win.title.clone(),
+        app_id: win.app_id.clone(),
     }
 }
 

@@ -7,7 +7,8 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use gtk4::{ApplicationWindow, DrawingArea};
 
-use crate::config::{AppearanceConfig, Color, Config, DisplayConfig, WorkspaceMode};
+use super::decorations::{draw_window_decorations, IconCache};
+use crate::config::{Color, Config, DisplayConfig, WorkspaceMode};
 use crate::state::{MinimapState, Window, Workspace};
 
 /// Outer padding around the minimap content, in minimap pixels.
@@ -23,6 +24,8 @@ pub struct MinimapWidget {
     hide_timeout_id: Rc<Cell<Option<glib::SourceId>>>,
     /// Track the last window ID that triggered a show via focus change
     last_shown_focus_id: Rc<Cell<Option<u64>>>,
+    /// Cache of resolved application icons, cleared on config reload
+    icon_cache: Rc<RefCell<IconCache>>,
 }
 
 impl MinimapWidget {
@@ -45,6 +48,7 @@ impl MinimapWidget {
             window: Rc::new(RefCell::new(None)),
             hide_timeout_id: Rc::new(Cell::new(None)),
             last_shown_focus_id: Rc::new(Cell::new(None)),
+            icon_cache: Rc::new(RefCell::new(IconCache::new())),
         };
 
         widget.setup_draw_handler();
@@ -156,6 +160,9 @@ impl MinimapWidget {
                 // Update the config
                 *self.config.borrow_mut() = new_config;
 
+                // Drop cached icons so theme_override changes take effect
+                self.icon_cache.borrow_mut().clear();
+
                 // Trigger resize and redraw
                 self.update_size();
                 self.drawing_area.queue_draw();
@@ -235,9 +242,10 @@ impl MinimapWidget {
     fn setup_draw_handler(&self) {
         let state = self.state.clone();
         let config = self.config.clone();
+        let icon_cache = self.icon_cache.clone();
 
         self.drawing_area
-            .set_draw_func(move |_area, cr, width, height| {
+            .set_draw_func(move |area, cr, width, height| {
                 let cfg = config.borrow();
                 let viewport_width = monitor_logical_width();
                 draw_minimap(
@@ -245,9 +253,10 @@ impl MinimapWidget {
                     width,
                     height,
                     &state.borrow(),
-                    &cfg.display,
-                    &cfg.appearance,
+                    &cfg,
                     viewport_width,
+                    &mut icon_cache.borrow_mut(),
+                    area.scale_factor(),
                 );
             });
     }
@@ -570,15 +579,19 @@ fn row_scaled_width_centered(layout: &WorkspaceLayout<'_>, row_inner_height: f64
 }
 
 /// Draw the minimap
+#[allow(clippy::too_many_arguments)]
 fn draw_minimap(
     cr: &Context,
     width: i32,
     height: i32,
     state: &MinimapState,
-    display: &DisplayConfig,
-    appearance: &AppearanceConfig,
+    config: &Config,
     viewport_width: f64,
+    icon_cache: &mut IconCache,
+    widget_scale: i32,
 ) {
+    let display = &config.display;
+    let appearance = &config.appearance;
     let width = width as f64;
     let height = height as f64;
 
@@ -620,7 +633,9 @@ fn draw_minimap(
                 PADDING,
                 inner_width,
                 row_inner_height,
-                appearance,
+                config,
+                icon_cache,
+                widget_scale,
             );
         }
         WorkspaceMode::All => {
@@ -683,7 +698,9 @@ fn draw_minimap(
                         geom.row_height,
                         geom.scale,
                         geom.viewport_anchor_x,
-                        appearance,
+                        config,
+                        icon_cache,
+                        widget_scale,
                     );
                 }
 
@@ -698,6 +715,7 @@ fn draw_minimap(
 ///
 /// Used for `current` mode: windows are grouped by column and laid out as a single
 /// scrolling-layout image, horizontally centered in the row.
+#[allow(clippy::too_many_arguments)]
 fn draw_workspace_row_centered(
     cr: &Context,
     layout: &WorkspaceLayout<'_>,
@@ -705,8 +723,11 @@ fn draw_workspace_row_centered(
     offset_y: f64,
     row_width: f64,
     row_height: f64,
-    appearance: &AppearanceConfig,
+    config: &Config,
+    icon_cache: &mut IconCache,
+    widget_scale: i32,
 ) {
+    let appearance = &config.appearance;
     if layout.total_width <= 0.0 || layout.max_height <= 0.0 || row_height <= 0.0 {
         return;
     }
@@ -788,6 +809,8 @@ fn draw_workspace_row_centered(
                 rounded_rectangle(cr, x, y, w, h, appearance.border_radius);
                 cr.stroke().ok();
             }
+
+            draw_window_decorations(cr, window, x, y, w, h, config, icon_cache, widget_scale);
         }
     }
 
@@ -815,8 +838,11 @@ fn draw_workspace_row_viewport(
     row_height: f64,
     scale: f64,
     viewport_anchor_x: f64,
-    appearance: &AppearanceConfig,
+    config: &Config,
+    icon_cache: &mut IconCache,
+    widget_scale: i32,
 ) {
+    let appearance = &config.appearance;
     if !layout.has_tiled || scale <= 0.0 || row_width <= 0.0 || row_height <= 0.0 {
         return;
     }
@@ -902,6 +928,8 @@ fn draw_workspace_row_viewport(
                 rounded_rectangle(cr, x, y, w, h, appearance.border_radius);
                 cr.stroke().ok();
             }
+
+            draw_window_decorations(cr, window, x, y, w, h, config, icon_cache, widget_scale);
         }
     }
 
