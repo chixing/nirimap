@@ -40,8 +40,10 @@ pub fn create_layer_window(
     // No keyboard interactivity (read-only minimap)
     window.set_keyboard_mode(KeyboardMode::None);
 
-    // Make window click-through (don't receive pointer events at GTK level)
-    window.set_can_target(false);
+    // Pointer events are enabled so MinimapWidget can receive clicks on
+    // window rectangles. The Wayland input region below remains empty until
+    // the widget has calculated the current rectangle locations.
+    window.set_can_target(true);
 
     // Configure anchor based on config
     configure_anchor(&window, config);
@@ -82,7 +84,8 @@ pub fn create_layer_window(
         gtk4::STYLE_PROVIDER_PRIORITY_USER,
     );
 
-    // Set up empty input region for true click-through at Wayland level
+    // Start with an empty input region. MinimapWidget replaces this with the
+    // union of the rendered window rectangles after the surface is realized.
     window.connect_realize(|window| {
         if let Some(surface) = window.surface() {
             // Create an empty region for input - this makes the surface click-through

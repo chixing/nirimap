@@ -11,7 +11,8 @@ A minimal workspace minimap overlay for the [Niri](https://github.com/YaLTeR/nir
 - Displays a minimap of your workspaces showing window layout
 - Two display modes: show every workspace stacked vertically (Overview-style) or only the active one
 - Renders as an overlay layer surface (visible over fullscreen windows)
-- Click-through design (doesn't intercept mouse events)
+- Clicks on window rectangles focus the corresponding Niri window
+- Empty minimap space remains click-through
 - Configurable appearance (colors, borders, gaps, opacity)
 - Application icons and text labels on window rectangles (configurable fonts, colors, positions)
 - Configurable visibility behavior (always visible or show on events)

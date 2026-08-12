@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use niri_ipc::socket::Socket;
-use niri_ipc::{Reply, Request, Response};
+use niri_ipc::{Action, Reply, Request, Response};
 
 /// Client for communicating with Niri via IPC
 pub struct NiriClient {
@@ -35,6 +35,15 @@ impl NiriClient {
         match reply {
             Response::Workspaces(workspaces) => Ok(workspaces),
             other => anyhow::bail!("Unexpected response for Workspaces request: {:?}", other),
+        }
+    }
+
+    /// Focus a window by its Niri window ID.
+    pub fn focus_window(&mut self, window_id: u64) -> Result<()> {
+        let reply = self.send(Request::Action(Action::FocusWindow { id: window_id }))?;
+        match reply {
+            Response::Handled => Ok(()),
+            other => anyhow::bail!("Unexpected response for FocusWindow request: {:?}", other),
         }
     }
 

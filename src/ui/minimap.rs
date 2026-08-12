@@ -2,10 +2,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-use gtk4::cairo::{Context, Operator};
+use gtk4::cairo::{Context, Operator, RectangleInt, Region};
 use gtk4::glib;
 use gtk4::prelude::*;
-use gtk4::{ApplicationWindow, DrawingArea};
+use gtk4::{ApplicationWindow, DrawingArea, GestureClick};
 
 use super::decorations::{draw_window_decorations, IconCache};
 use crate::config::{Color, Config, DisplayConfig, WorkspaceMode};
@@ -60,6 +60,7 @@ impl MinimapWidget {
         };
 
         widget.setup_draw_handler();
+        widget.setup_pointer_handler();
         widget
     }
 
@@ -69,7 +70,12 @@ impl MinimapWidget {
         if !self.config.borrow().behavior.always_visible {
             window.set_visible(false);
         }
+        let minimap = self.clone();
+        window.connect_realize(move |_| {
+            minimap.update_input_region();
+        });
         *self.window.borrow_mut() = Some(window);
+        self.update_input_region();
     }
 
     /// Show the minimap (with auto-hide timeout if configured)
@@ -173,6 +179,7 @@ impl MinimapWidget {
 
                 // Trigger resize and redraw
                 self.update_size();
+                self.update_input_region();
                 self.drawing_area.queue_draw();
 
                 tracing::info!("Configuration reloaded");
@@ -195,12 +202,14 @@ impl MinimapWidget {
     {
         f(&mut self.state.borrow_mut());
         self.update_size();
+        self.update_input_region();
         self.drawing_area.queue_draw();
     }
 
     /// Recalculate the size and redraw after a shared state update.
     pub fn refresh(&self) {
         self.update_size();
+        self.update_input_region();
         self.drawing_area.queue_draw();
     }
 
@@ -271,6 +280,93 @@ impl MinimapWidget {
                 );
             });
     }
+
+    /// Set up pointer handling for the rendered window rectangles.
+    fn setup_pointer_handler(&self) {
+        let state = self.state.clone();
+        let config = self.config.clone();
+        let output = self.output.clone();
+        let monitor = self.monitor.clone();
+        let drawing_area = self.drawing_area.clone();
+
+        let click = GestureClick::new();
+        click.set_button(1);
+        click.connect_pressed(move |_, _, x, y| {
+            let (viewport_width, viewport_height) = monitor_logical_size(&monitor);
+            let targets = window_hitboxes(
+                &state.borrow(),
+                &config.borrow(),
+                viewport_width,
+                viewport_height,
+                &output,
+                drawing_area.width() as f64,
+                drawing_area.height() as f64,
+            );
+
+            let Some(target) = targets.into_iter().find(|target| target.contains(x, y)) else {
+                return;
+            };
+
+            std::thread::spawn(move || {
+                if let Err(error) = crate::ipc::NiriClient::connect()
+                    .and_then(|mut client| client.focus_window(target.window_id))
+                {
+                    tracing::warn!(
+                        "Failed to focus window {} from minimap click: {}",
+                        target.window_id,
+                        error
+                    );
+                }
+            });
+        });
+        self.drawing_area.add_controller(click);
+
+        let minimap = self.clone();
+        self.drawing_area.connect_resize(move |_, _, _| {
+            minimap.update_input_region();
+        });
+    }
+
+    /// Limit Wayland input to the rendered window rectangles.
+    ///
+    /// The minimap surface remains click-through everywhere outside these
+    /// rectangles, including workspace gaps and transparent background.
+    fn update_input_region(&self) {
+        let window_ref = self.window.borrow();
+        let Some(window) = window_ref.as_ref() else {
+            return;
+        };
+        let Some(surface) = window.surface() else {
+            return;
+        };
+
+        let width = self.drawing_area.width() as f64;
+        let height = self.drawing_area.height() as f64;
+        let (viewport_width, viewport_height) = monitor_logical_size(&self.monitor);
+        let targets = window_hitboxes(
+            &self.state.borrow(),
+            &self.config.borrow(),
+            viewport_width,
+            viewport_height,
+            &self.output,
+            width,
+            height,
+        );
+
+        let region = Region::create();
+        for target in targets {
+            let left = target.x.floor() as i32;
+            let top = target.y.floor() as i32;
+            let right = (target.x + target.width).ceil() as i32;
+            let bottom = (target.y + target.height).ceil() as i32;
+            if right > left && bottom > top {
+                region
+                    .union_rectangle(&RectangleInt::new(left, top, right - left, bottom - top))
+                    .ok();
+            }
+        }
+        surface.set_input_region(Some(&region));
+    }
 }
 
 /// Monitor's logical dimensions — used as the workspace viewport size.
@@ -302,6 +398,158 @@ struct WorkspaceLayout<'a> {
     anchored_right: f64,
     /// Whether this workspace has any tiled windows.
     has_tiled: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WindowHitbox {
+    window_id: u64,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+impl WindowHitbox {
+    fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
+}
+
+/// Calculate the visible clickable rectangles using the same geometry as the
+/// renderer. Floating windows are intentionally omitted because they are not
+/// drawn in the minimap.
+#[allow(clippy::too_many_arguments)]
+fn window_hitboxes(
+    state: &MinimapState,
+    config: &Config,
+    viewport_width: f64,
+    viewport_height: f64,
+    output: &str,
+    widget_width: f64,
+    widget_height: f64,
+) -> Vec<WindowHitbox> {
+    if widget_width <= 0.0 || widget_height <= 0.0 {
+        return Vec::new();
+    }
+
+    let inner_width = (widget_width - PADDING * 2.0).max(0.0);
+    match config.display.workspace_mode {
+        WorkspaceMode::Current => {
+            let Some(workspace) = state.active_workspace_for_output(output) else {
+                return Vec::new();
+            };
+            let layout = build_workspace_layout(workspace, viewport_width);
+            if layout.total_width <= 0.0 || layout.max_height <= 0.0 {
+                return Vec::new();
+            }
+
+            let row_height = (widget_height - PADDING * 2.0).max(0.0);
+            let scale = row_height / layout.max_height;
+            let scaled_width = layout.total_width * scale;
+            let x_origin = PADDING + (inner_width - scaled_width).max(0.0) / 2.0;
+
+            workspace_window_hitboxes(
+                &layout,
+                x_origin,
+                PADDING,
+                scale,
+                config.appearance.gap,
+                PADDING,
+                PADDING,
+                PADDING + inner_width,
+                PADDING + row_height,
+            )
+        }
+        WorkspaceMode::All => {
+            let rows = all_mode_rows(state, output, viewport_width);
+            if rows.is_empty() {
+                return Vec::new();
+            }
+
+            let geom = compute_all_mode_geometry(
+                &rows,
+                &config.display,
+                config.appearance.workspace_gap,
+                widget_width,
+                widget_height,
+                viewport_width,
+                viewport_height,
+            );
+            if geom.scale <= 0.0 {
+                return Vec::new();
+            }
+
+            let mut targets = Vec::new();
+            let mut y = PADDING;
+            for layout in &rows {
+                if layout.has_tiled {
+                    let row_x_origin = geom.viewport_anchor_x - layout.align_x * geom.scale;
+                    targets.extend(workspace_window_hitboxes(
+                        layout,
+                        row_x_origin,
+                        y,
+                        geom.scale,
+                        config.appearance.gap,
+                        PADDING,
+                        y,
+                        PADDING + inner_width,
+                        y + geom.row_height,
+                    ));
+                }
+                y += geom.row_height + config.appearance.workspace_gap;
+            }
+            targets
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn workspace_window_hitboxes(
+    layout: &WorkspaceLayout<'_>,
+    x_origin: f64,
+    y_origin: f64,
+    scale: f64,
+    gap: f64,
+    clip_left: f64,
+    clip_top: f64,
+    clip_right: f64,
+    clip_bottom: f64,
+) -> Vec<WindowHitbox> {
+    let half_gap = gap / 2.0;
+    let mut targets = Vec::new();
+
+    for (&col_idx, windows) in &layout.columns {
+        let col_x = layout
+            .column_x_positions
+            .get(col_idx)
+            .copied()
+            .unwrap_or(0.0);
+        let mut y_pos = 0.0;
+
+        for window in windows {
+            let x = x_origin + col_x * scale + half_gap;
+            let y = y_origin + y_pos * scale + half_gap;
+            let width = (window.size.0 * scale - gap).max(1.0);
+            let height = (window.size.1 * scale - gap).max(1.0);
+            y_pos += window.size.1;
+
+            let left = x.max(clip_left);
+            let top = y.max(clip_top);
+            let right = (x + width).min(clip_right);
+            let bottom = (y + height).min(clip_bottom);
+            if right > left && bottom > top {
+                targets.push(WindowHitbox {
+                    window_id: window.id,
+                    x: left,
+                    y: top,
+                    width: right - left,
+                    height: bottom - top,
+                });
+            }
+        }
+    }
+
+    targets
 }
 
 /// Select the workspaces that should appear in `all` mode:
@@ -1001,7 +1249,7 @@ fn rounded_rectangle(cr: &Context, x: f64, y: f64, width: f64, height: f64, radi
 
 #[cfg(test)]
 mod tests {
-    use super::aspect_ratio_min_width;
+    use super::{aspect_ratio_min_width, WindowHitbox};
 
     #[test]
     fn portrait_monitor_min_width_follows_aspect_ratio() {
@@ -1018,5 +1266,22 @@ mod tests {
     #[test]
     fn invalid_monitor_size_uses_square_fallback() {
         assert_eq!(aspect_ratio_min_width(100.0, 1080.0, 0.0), 100.0);
+    }
+
+    #[test]
+    fn window_hitbox_contains_only_points_inside_rectangle() {
+        let hitbox = WindowHitbox {
+            window_id: 1,
+            x: 10.0,
+            y: 20.0,
+            width: 30.0,
+            height: 40.0,
+        };
+
+        assert!(hitbox.contains(10.0, 20.0));
+        assert!(hitbox.contains(39.99, 59.99));
+        assert!(!hitbox.contains(40.0, 30.0));
+        assert!(!hitbox.contains(20.0, 60.0));
+        assert!(!hitbox.contains(9.99, 30.0));
     }
 }
