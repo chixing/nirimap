@@ -55,6 +55,9 @@ pub struct MinimapState {
     pub active_workspace_id: Option<u64>,
     /// Currently focused window ID
     pub focused_window_id: Option<u64>,
+    /// Whether Niri Overview is currently open. Temporary Overview layout
+    /// changes are ignored so the minimap keeps its pre-Overview geometry.
+    pub overview_open: bool,
 }
 
 impl MinimapState {
@@ -237,6 +240,7 @@ mod tests {
         assert!(state.workspaces.is_empty());
         assert_eq!(state.active_workspace_id, None);
         assert_eq!(state.focused_window_id, None);
+        assert!(!state.overview_open);
     }
 
     #[test]

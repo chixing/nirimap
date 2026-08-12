@@ -24,6 +24,9 @@ pub struct MinimapWidget {
     monitor: gtk4::gdk::Monitor,
     window: Rc<RefCell<Option<ApplicationWindow>>>,
     hide_timeout_id: Rc<Cell<Option<glib::SourceId>>>,
+    /// Whether Niri Overview is currently open. Geometry is held stable while
+    /// Overview emits its temporary layout changes.
+    overview_open: Rc<Cell<bool>>,
     /// Track the last window ID that triggered a show via focus change
     last_shown_focus_id: Rc<Cell<Option<u64>>>,
     /// Cache of resolved application icons, cleared on config reload
@@ -55,6 +58,7 @@ impl MinimapWidget {
             monitor,
             window: Rc::new(RefCell::new(None)),
             hide_timeout_id: Rc::new(Cell::new(None)),
+            overview_open: Rc::new(Cell::new(false)),
             last_shown_focus_id: Rc::new(Cell::new(None)),
             icon_cache: Rc::new(RefCell::new(IconCache::new())),
         };
@@ -178,9 +182,7 @@ impl MinimapWidget {
                 self.icon_cache.borrow_mut().clear();
 
                 // Trigger resize and redraw
-                self.update_size();
-                self.update_input_region();
-                self.drawing_area.queue_draw();
+                self.refresh_geometry_and_draw();
 
                 tracing::info!("Configuration reloaded");
             }
@@ -201,15 +203,29 @@ impl MinimapWidget {
         F: FnOnce(&mut MinimapState),
     {
         f(&mut self.state.borrow_mut());
-        self.update_size();
-        self.update_input_region();
-        self.drawing_area.queue_draw();
+        self.refresh_geometry_and_draw();
     }
 
     /// Recalculate the size and redraw after a shared state update.
     pub fn refresh(&self) {
-        self.update_size();
-        self.update_input_region();
+        self.refresh_geometry_and_draw();
+    }
+
+    /// Track Niri Overview and recompute the minimap geometry once it closes.
+    ///
+    /// Overview temporarily changes tile sizes while it animates. Keeping the
+    /// layer dimensions stable during those events prevents the overlay from
+    /// shifting under a top bar or other anchored UI.
+    pub fn set_overview_open(&self, is_open: bool) {
+        let was_open = self.overview_open.replace(is_open);
+        if was_open == is_open {
+            return;
+        }
+
+        if !is_open {
+            self.update_size();
+            self.update_input_region();
+        }
         self.drawing_area.queue_draw();
     }
 
@@ -240,6 +256,16 @@ impl MinimapWidget {
             window.set_default_width(final_width);
             window.set_default_height(final_height);
         }
+    }
+
+    fn refresh_geometry_and_draw(&self) {
+        if !self.overview_open.get() {
+            self.update_size();
+        }
+        // Keep click targets aligned with the current drawing even while the
+        // layer's outer dimensions remain frozen during Overview.
+        self.update_input_region();
+        self.drawing_area.queue_draw();
     }
 
     /// Get monitor-based caps for widget width and height.
@@ -901,6 +927,7 @@ fn draw_minimap(
                 config,
                 icon_cache,
                 widget_scale,
+                state.overview_open,
             );
         }
         WorkspaceMode::All => {
@@ -976,6 +1003,7 @@ fn draw_minimap(
                         config,
                         icon_cache,
                         widget_scale,
+                        state.overview_open,
                     );
                 }
 
@@ -1001,6 +1029,7 @@ fn draw_workspace_row_centered(
     config: &Config,
     icon_cache: &mut IconCache,
     widget_scale: i32,
+    overview_open: bool,
 ) {
     let appearance = &config.appearance;
     if layout.total_width <= 0.0 || layout.max_height <= 0.0 || row_height <= 0.0 {
@@ -1061,7 +1090,9 @@ fn draw_workspace_row_centered(
                 continue;
             }
 
-            let (fill_color, fill_alpha) = if window.is_focused {
+            let is_highlighted = window.is_focused
+                || (overview_open && layout.workspace.active_window_id == Some(window.id));
+            let (fill_color, fill_alpha) = if is_highlighted {
                 (&focused_color, appearance.focused_opacity)
             } else {
                 (&window_color, appearance.window_opacity)
@@ -1116,6 +1147,7 @@ fn draw_workspace_row_viewport(
     config: &Config,
     icon_cache: &mut IconCache,
     widget_scale: i32,
+    overview_open: bool,
 ) {
     let appearance = &config.appearance;
     if !layout.has_tiled || scale <= 0.0 || row_width <= 0.0 || row_height <= 0.0 {
@@ -1180,7 +1212,9 @@ fn draw_workspace_row_viewport(
                 continue;
             }
 
-            let (fill_color, fill_alpha) = if window.is_focused {
+            let is_highlighted = window.is_focused
+                || (overview_open && layout.workspace.active_window_id == Some(window.id));
+            let (fill_color, fill_alpha) = if is_highlighted {
                 (&focused_color, appearance.focused_opacity)
             } else {
                 (&window_color, appearance.window_opacity)

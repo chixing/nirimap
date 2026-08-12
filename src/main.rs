@@ -320,26 +320,24 @@ fn apply_state_update(minimaps: &[MinimapWidget], update: StateUpdate) {
         }
 
         StateUpdate::FocusChanged(window_id) => {
-            if let Some(window_id) = window_id {
-                // Niri reports no focused window while Overview owns focus.
-                // Keep the last focused tile highlighted so the minimap still
-                // shows where focus will return when Overview closes.
-                update_shared_state(minimaps, |state| {
-                    state.set_focused_window(Some(window_id));
-                });
-
-                // Show the minimap only if focus changed to a different window.
-                for minimap in minimaps {
-                    minimap.show_on_focus_change(Some(window_id));
-                }
-            } else {
-                // Do not clear the last focused tile when Niri's Overview is
-                // active; its focus is not a normal window focus.
-                for minimap in minimaps {
-                    minimap.refresh();
-                }
+            update_shared_state(minimaps, |state| {
+                state.set_focused_window(window_id);
+            });
+            // Show the minimap only if focus changed to a different window
+            for minimap in minimaps {
+                minimap.show_on_focus_change(window_id);
             }
             tracing::debug!("Focus changed to {:?}", window_id);
+        }
+
+        StateUpdate::OverviewChanged(is_open) => {
+            update_shared_state(minimaps, |state| {
+                state.overview_open = is_open;
+            });
+            for minimap in minimaps {
+                minimap.set_overview_open(is_open);
+            }
+            tracing::debug!("Overview {}", if is_open { "opened" } else { "closed" });
         }
 
         StateUpdate::WorkspaceActivated { id, focused } => {
@@ -383,7 +381,13 @@ fn apply_state_update(minimaps: &[MinimapWidget], update: StateUpdate) {
         }
 
         StateUpdate::LayoutsChanged(layouts) => {
+            let mut skipped_for_overview = false;
             update_shared_state(minimaps, |state| {
+                if state.overview_open {
+                    skipped_for_overview = true;
+                    return;
+                }
+
                 for (window_id, layout) in layouts {
                     // Find and update the window's layout
                     for workspace in state.workspaces.values_mut() {
@@ -402,9 +406,13 @@ fn apply_state_update(minimaps: &[MinimapWidget], update: StateUpdate) {
                     }
                 }
             });
-            // Show the minimap when layouts change (window resize, move, etc.)
-            show_all(minimaps);
-            tracing::debug!("Window layouts changed");
+            if skipped_for_overview {
+                tracing::debug!("Skipped temporary Overview window layouts");
+            } else {
+                // Show the minimap when layouts change (window resize, move, etc.)
+                show_all(minimaps);
+                tracing::debug!("Window layouts changed");
+            }
         }
     }
 }

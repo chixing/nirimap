@@ -19,6 +19,8 @@ pub enum StateUpdate {
     WindowClosed(u64),
     /// Window focus changed
     FocusChanged(Option<u64>),
+    /// Niri Overview opened or closed
+    OverviewChanged(bool),
     /// Active workspace changed
     WorkspaceActivated { id: u64, focused: bool },
     /// Window layouts changed
@@ -213,6 +215,7 @@ fn event_to_update(event: Event) -> Option<StateUpdate> {
         }
         Event::WindowClosed { id } => Some(StateUpdate::WindowClosed(id)),
         Event::WindowFocusChanged { id } => Some(StateUpdate::FocusChanged(id)),
+        Event::OverviewOpenedOrClosed { is_open } => Some(StateUpdate::OverviewChanged(is_open)),
         Event::WorkspaceActivated { id, focused } => {
             Some(StateUpdate::WorkspaceActivated { id, focused })
         }
