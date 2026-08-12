@@ -17,6 +17,7 @@ A minimal workspace minimap overlay for the [Niri](https://github.com/YaLTeR/nir
 - Configurable visibility behavior (always visible or show on events)
 - Hot-reloads configuration changes
 - Dynamic sizing based on workspace content
+- Creates one minimap overlay per connected monitor
 
 ## Installation
 
@@ -190,11 +191,11 @@ otherwise cause a distracting on/off flash. Set
 
 ## Known Limitations
 
-### Multi-Monitor Support
+### Monitor Hotplugging
 
-nirimap currently only tracks and displays windows on a single monitor. Multi-monitor setups may result in windows not appearing on the minimap or incorrect workspace tracking. Full multi-monitor support is planned.
-
-See [Issue #21](https://github.com/alexandergknoll/nirimap/issues/21) for more details.
+Monitor windows are created when nirimap starts. Restart nirimap after adding,
+removing, or reconnecting monitors so the overlay set matches the current
+outputs.
 
 ### Floating Windows
 

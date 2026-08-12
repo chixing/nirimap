@@ -20,6 +20,8 @@ pub struct MinimapWidget {
     drawing_area: DrawingArea,
     state: Rc<RefCell<MinimapState>>,
     config: Rc<RefCell<Config>>,
+    output: String,
+    monitor: gtk4::gdk::Monitor,
     window: Rc<RefCell<Option<ApplicationWindow>>>,
     hide_timeout_id: Rc<Cell<Option<glib::SourceId>>>,
     /// Track the last window ID that triggered a show via focus change
@@ -30,11 +32,15 @@ pub struct MinimapWidget {
 
 impl MinimapWidget {
     /// Create a new minimap widget
-    pub fn new(config: Rc<RefCell<Config>>) -> Self {
+    pub fn new(
+        config: Rc<RefCell<Config>>,
+        state: Rc<RefCell<MinimapState>>,
+        output: String,
+        monitor: gtk4::gdk::Monitor,
+    ) -> Self {
         let drawing_area = DrawingArea::new();
         // Tag for the transparency CSS (see layer.rs).
         drawing_area.add_css_class("nirimap-canvas");
-        let state = Rc::new(RefCell::new(MinimapState::new()));
 
         // Start with just the height; width will be calculated
         let height = config.borrow().display.height as i32;
@@ -45,6 +51,8 @@ impl MinimapWidget {
             drawing_area,
             state,
             config,
+            output,
+            monitor,
             window: Rc::new(RefCell::new(None)),
             hide_timeout_id: Rc::new(Cell::new(None)),
             last_shown_focus_id: Rc::new(Cell::new(None)),
@@ -190,13 +198,19 @@ impl MinimapWidget {
         self.drawing_area.queue_draw();
     }
 
+    /// Recalculate the size and redraw after a shared state update.
+    pub fn refresh(&self) {
+        self.update_size();
+        self.drawing_area.queue_draw();
+    }
+
     /// Calculate and update the widget/window size based on current state
     fn update_size(&self) {
         let state = self.state.borrow();
         let config = self.config.borrow();
 
         let (max_width, max_height) = self.get_monitor_caps();
-        let viewport_width = monitor_logical_width();
+        let (viewport_width, viewport_height) = monitor_logical_size(&self.monitor);
         let dims = compute_widget_dimensions(
             &state,
             &config.display,
@@ -204,6 +218,8 @@ impl MinimapWidget {
             max_width,
             max_height,
             viewport_width,
+            viewport_height,
+            &self.output,
         );
 
         let final_width = dims.width.ceil() as i32;
@@ -223,31 +239,24 @@ impl MinimapWidget {
         let max_width_percent = display_cfg.max_width_percent;
         let max_height_percent = display_cfg.max_height_percent;
 
-        if let Some(display) = gtk4::gdk::Display::default() {
-            if let Some(monitor) = display.monitors().item(0) {
-                if let Some(monitor) = monitor.downcast_ref::<gtk4::gdk::Monitor>() {
-                    let geometry = monitor.geometry();
-                    let w = geometry.width() as f64 * max_width_percent;
-                    let h = geometry.height() as f64 * max_height_percent;
-                    return (w, h);
-                }
-            }
-        }
-
-        // Fallback: use a reasonable default (1920x1080 baseline)
-        (1920.0 * max_width_percent, 1080.0 * max_height_percent)
+        let geometry = self.monitor.geometry();
+        let w = geometry.width() as f64 * max_width_percent;
+        let h = geometry.height() as f64 * max_height_percent;
+        (w, h)
     }
 
     /// Set up the draw handler
     fn setup_draw_handler(&self) {
         let state = self.state.clone();
         let config = self.config.clone();
+        let output = self.output.clone();
+        let monitor = self.monitor.clone();
         let icon_cache = self.icon_cache.clone();
 
         self.drawing_area
             .set_draw_func(move |area, cr, width, height| {
                 let cfg = config.borrow();
-                let viewport_width = monitor_logical_width();
+                let (viewport_width, viewport_height) = monitor_logical_size(&monitor);
                 draw_minimap(
                     cr,
                     width,
@@ -255,6 +264,8 @@ impl MinimapWidget {
                     &state.borrow(),
                     &cfg,
                     viewport_width,
+                    viewport_height,
+                    &output,
                     &mut icon_cache.borrow_mut(),
                     area.scale_factor(),
                 );
@@ -262,21 +273,10 @@ impl MinimapWidget {
     }
 }
 
-/// Monitor's logical width — used as the workspace viewport width.
-///
-/// Niri's per-workspace viewport equals its output's logical width. We don't
-/// query niri-ipc for output info today, so we use the GTK display's monitor
-/// geometry, which matches for the single-output case (the only setup nirimap
-/// currently supports — see "Known limitations" in the README).
-fn monitor_logical_width() -> f64 {
-    if let Some(display) = gtk4::gdk::Display::default() {
-        if let Some(monitor) = display.monitors().item(0) {
-            if let Some(monitor) = monitor.downcast_ref::<gtk4::gdk::Monitor>() {
-                return monitor.geometry().width() as f64;
-            }
-        }
-    }
-    1920.0
+/// Monitor's logical dimensions — used as the workspace viewport size.
+fn monitor_logical_size(monitor: &gtk4::gdk::Monitor) -> (f64, f64) {
+    let geometry = monitor.geometry();
+    (geometry.width() as f64, geometry.height() as f64)
 }
 
 /// Per-workspace geometry computed from its tiled windows.
@@ -308,12 +308,15 @@ struct WorkspaceLayout<'a> {
 /// any workspace that has at least one window, plus the focused one even if empty.
 /// This filters out Niri's trailing placeholder workspace (the always-present empty
 /// workspace users can scroll into to create a new one) unless the user is on it.
-fn all_mode_rows(state: &MinimapState, viewport_width: f64) -> Vec<WorkspaceLayout<'_>> {
-    let active_id = state.active_workspace_id;
+fn all_mode_rows<'a>(
+    state: &'a MinimapState,
+    output: &str,
+    viewport_width: f64,
+) -> Vec<WorkspaceLayout<'a>> {
     state
-        .workspaces_sorted()
+        .workspaces_for_output(output)
         .into_iter()
-        .filter(|ws| !ws.windows.is_empty() || Some(ws.id) == active_id)
+        .filter(|ws| !ws.windows.is_empty() || ws.is_active)
         .map(|ws| build_workspace_layout(ws, viewport_width))
         .collect()
 }
@@ -439,9 +442,10 @@ fn compute_all_mode_geometry(
     max_width: f64,
     max_height: f64,
     viewport_width: f64,
+    viewport_height: f64,
 ) -> AllModeGeometry {
     let row_height_cfg = display.height as f64;
-    let min_widget_width = row_height_cfg;
+    let min_widget_width = aspect_ratio_min_width(row_height_cfg, viewport_width, viewport_height);
 
     let n = rows.len().max(1) as f64;
     let total_gap = (n - 1.0).max(0.0) * workspace_gap;
@@ -523,16 +527,18 @@ fn compute_widget_dimensions(
     max_width: f64,
     max_height: f64,
     viewport_width: f64,
+    viewport_height: f64,
+    output: &str,
 ) -> WidgetDimensions {
     let row_height_cfg = display.height as f64;
-    let min_widget_width = row_height_cfg;
+    let min_widget_width = aspect_ratio_min_width(row_height_cfg, viewport_width, viewport_height);
 
     match display.workspace_mode {
         WorkspaceMode::Current => {
             let widget_height = row_height_cfg;
             let row_height = (widget_height - PADDING * 2.0).max(0.0);
             let scaled_w = state
-                .active_workspace()
+                .active_workspace_for_output(output)
                 .map(|ws| {
                     row_scaled_width_centered(
                         &build_workspace_layout(ws, viewport_width),
@@ -550,7 +556,7 @@ fn compute_widget_dimensions(
             }
         }
         WorkspaceMode::All => {
-            let rows = all_mode_rows(state, viewport_width);
+            let rows = all_mode_rows(state, output, viewport_width);
             let geom = compute_all_mode_geometry(
                 &rows,
                 display,
@@ -558,6 +564,7 @@ fn compute_widget_dimensions(
                 max_width,
                 max_height,
                 viewport_width,
+                viewport_height,
             );
 
             WidgetDimensions {
@@ -565,6 +572,14 @@ fn compute_widget_dimensions(
                 height: geom.widget_height,
             }
         }
+    }
+}
+
+fn aspect_ratio_min_width(row_height: f64, viewport_width: f64, viewport_height: f64) -> f64 {
+    if viewport_width > 0.0 && viewport_height > 0.0 {
+        row_height * viewport_width / viewport_height
+    } else {
+        row_height
     }
 }
 
@@ -587,6 +602,8 @@ fn draw_minimap(
     state: &MinimapState,
     config: &Config,
     viewport_width: f64,
+    viewport_height: f64,
+    output: &str,
     icon_cache: &mut IconCache,
     widget_scale: i32,
 ) {
@@ -618,7 +635,7 @@ fn draw_minimap(
 
     match display.workspace_mode {
         WorkspaceMode::Current => {
-            let Some(workspace) = state.active_workspace() else {
+            let Some(workspace) = state.active_workspace_for_output(output) else {
                 return;
             };
             let layout = build_workspace_layout(workspace, viewport_width);
@@ -639,7 +656,7 @@ fn draw_minimap(
             );
         }
         WorkspaceMode::All => {
-            let rows = all_mode_rows(state, viewport_width);
+            let rows = all_mode_rows(state, output, viewport_width);
             if rows.is_empty() {
                 return;
             }
@@ -655,6 +672,7 @@ fn draw_minimap(
                 width,
                 height,
                 viewport_width,
+                viewport_height,
             );
 
             let active_border = Color::from_hex(&appearance.active_workspace_border_color)
@@ -669,6 +687,15 @@ fn draw_minimap(
             for layout in &rows {
                 // Active workspace highlight: border around the row rectangle.
                 if layout.workspace.is_active && appearance.active_workspace_border_width > 0.0 {
+                    let content_x = geom.viewport_anchor_x - layout.align_x * geom.scale;
+                    let content_width = if layout.has_tiled {
+                        layout.total_width * geom.scale
+                    } else {
+                        aspect_ratio_min_width(geom.row_height, viewport_width, viewport_height)
+                    };
+                    let border_left = content_x.max(PADDING);
+                    let border_right = (content_x + content_width).min(PADDING + inner_width);
+                    let border_width = (border_right - border_left).max(0.0);
                     cr.set_source_rgba(
                         active_border.r,
                         active_border.g,
@@ -679,9 +706,9 @@ fn draw_minimap(
                     let inset = appearance.active_workspace_border_width / 2.0;
                     rounded_rectangle(
                         cr,
-                        PADDING + inset,
+                        border_left + inset,
                         y + inset,
-                        (inner_width - inset * 2.0).max(0.0),
+                        (border_width - inset * 2.0).max(0.0),
                         (geom.row_height - inset * 2.0).max(0.0),
                         appearance.border_radius,
                     );
@@ -970,4 +997,26 @@ fn rounded_rectangle(cr: &Context, x: f64, y: f64, width: f64, height: f64, radi
         3.0 * std::f64::consts::FRAC_PI_2,
     );
     cr.close_path();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::aspect_ratio_min_width;
+
+    #[test]
+    fn portrait_monitor_min_width_follows_aspect_ratio() {
+        let width = aspect_ratio_min_width(100.0, 1080.0, 1920.0);
+        assert!((width - 56.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn landscape_monitor_min_width_follows_aspect_ratio() {
+        let width = aspect_ratio_min_width(100.0, 2560.0, 1440.0);
+        assert!((width - (100.0 * 2560.0 / 1440.0)).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn invalid_monitor_size_uses_square_fallback() {
+        assert_eq!(aspect_ratio_min_width(100.0, 1080.0, 0.0), 100.0);
+    }
 }

@@ -91,6 +91,25 @@ impl MinimapState {
         out
     }
 
+    /// Workspaces on one output, sorted in their vertical niri order.
+    pub fn workspaces_for_output(&self, output: &str) -> Vec<&Workspace> {
+        self.workspaces_sorted()
+            .into_iter()
+            .filter(|workspace| workspace.output.as_deref() == Some(output))
+            .collect()
+    }
+
+    /// Get the active workspace on one output.
+    pub fn active_workspace_for_output(&self, output: &str) -> Option<&Workspace> {
+        self.workspaces
+            .values()
+            .find(|workspace| workspace.output.as_deref() == Some(output) && workspace.is_active)
+            .or_else(|| {
+                self.active_workspace()
+                    .filter(|workspace| workspace.output.as_deref() == Some(output))
+            })
+    }
+
     /// Replace workspace metadata from a fresh snapshot, preserving existing
     /// window data for workspaces that still exist.
     ///
@@ -167,9 +186,16 @@ impl MinimapState {
 
     /// Set the active workspace
     pub fn set_active_workspace(&mut self, workspace_id: u64) {
-        // Clear old active state
+        let output = self
+            .workspaces
+            .get(&workspace_id)
+            .and_then(|workspace| workspace.output.clone());
+
+        // Active workspaces are tracked independently for each output.
         for workspace in self.workspaces.values_mut() {
-            workspace.is_active = false;
+            if output.is_none() || workspace.output == output {
+                workspace.is_active = false;
+            }
         }
 
         // Set new active state
@@ -374,6 +400,52 @@ mod tests {
         let sorted_ids: Vec<u64> = state.workspaces_sorted().iter().map(|w| w.id).collect();
         // DP-1: idx 1, 2, 3 -> 1, 3, 4; then HDMI-1 idx 1 -> 5; then no-output -> 7
         assert_eq!(sorted_ids, vec![1, 3, 4, 5, 7]);
+    }
+
+    #[test]
+    fn test_workspaces_for_output_are_sorted_and_filtered() {
+        let mut state = MinimapState::new();
+        let incoming = vec![
+            ipc_workspace(1, 2, Some("HDMI-1"), false, false),
+            ipc_workspace(2, 1, Some("DP-1"), true, true),
+            ipc_workspace(3, 1, Some("HDMI-1"), true, false),
+            ipc_workspace(4, 1, Some("HDMI-1"), false, false),
+        ];
+        state.replace_workspace_metadata(&incoming);
+
+        let ids: Vec<u64> = state
+            .workspaces_for_output("HDMI-1")
+            .iter()
+            .map(|workspace| workspace.id)
+            .collect();
+        assert_eq!(ids, vec![3, 4, 1]);
+    }
+
+    #[test]
+    fn test_active_workspace_is_tracked_per_output() {
+        let mut state = MinimapState::new();
+        let incoming = vec![
+            ipc_workspace(1, 1, Some("HDMI-1"), true, true),
+            ipc_workspace(2, 1, Some("DP-1"), true, false),
+        ];
+        state.replace_workspace_metadata(&incoming);
+
+        assert_eq!(
+            state
+                .active_workspace_for_output("HDMI-1")
+                .map(|workspace| workspace.id),
+            Some(1)
+        );
+        assert_eq!(
+            state
+                .active_workspace_for_output("DP-1")
+                .map(|workspace| workspace.id),
+            Some(2)
+        );
+
+        state.set_active_workspace(2);
+        assert!(state.workspaces.get(&1).unwrap().is_active);
+        assert!(state.workspaces.get(&2).unwrap().is_active);
     }
 
     #[test]

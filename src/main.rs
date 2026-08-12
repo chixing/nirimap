@@ -9,13 +9,14 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use gtk4::glib;
 use gtk4::prelude::*;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use config::Config;
 use ipc::StateUpdate;
+use state::MinimapState;
 use ui::{create_layer_window, MinimapWidget};
 
 const APP_ID: &str = "com.github.nirimap";
@@ -65,17 +66,12 @@ fn main() -> Result<()> {
 }
 
 fn activate(app: &gtk4::Application, config: Rc<RefCell<Config>>) -> Result<()> {
-    // Create the layer-shell window
-    let window = create_layer_window(app, &config.borrow());
-
-    // Create the minimap widget
-    let minimap = MinimapWidget::new(config.clone());
-
-    // Connect the window to the minimap for dynamic resizing
-    minimap.set_window(window.clone());
-
-    // Add the minimap widget to the window
-    window.set_child(Some(minimap.widget()));
+    let state = Rc::new(RefCell::new(MinimapState::new()));
+    let minimaps = create_minimaps(app, config.clone(), state)?;
+    if minimaps.is_empty() {
+        anyhow::bail!("No monitors with niri output names were found");
+    }
+    let minimaps = Rc::new(minimaps);
 
     // Set up channel for state updates from IPC thread
     let (tx, rx) = mpsc::channel::<StateUpdate>();
@@ -103,7 +99,7 @@ fn activate(app: &gtk4::Application, config: Rc<RefCell<Config>>) -> Result<()> 
     });
 
     // Set up glib idle handler to process state updates and config reloads
-    let minimap_clone = minimap.clone();
+    let minimaps_clone = minimaps.clone();
     let last_config_reload = Rc::new(RefCell::new(Instant::now()));
     let config_reload_debounce = Duration::from_millis(CONFIG_RELOAD_DEBOUNCE_MS);
 
@@ -111,7 +107,7 @@ fn activate(app: &gtk4::Application, config: Rc<RefCell<Config>>) -> Result<()> 
         // Process a batch of state updates
         for _ in 0..10 {
             if let Ok(update) = rx.try_recv() {
-                apply_state_update(&minimap_clone, update);
+                apply_state_update(&minimaps_clone, update);
             } else {
                 break;
             }
@@ -124,7 +120,9 @@ fn activate(app: &gtk4::Application, config: Rc<RefCell<Config>>) -> Result<()> 
 
             // Only reload if enough time has passed since the last reload
             if now.duration_since(*last_reload) >= config_reload_debounce {
-                minimap_clone.reload_config();
+                for minimap in minimaps_clone.iter() {
+                    minimap.reload_config();
+                }
                 *last_reload = now;
             } else {
                 tracing::debug!("Config reload debounced (too soon after last reload)");
@@ -134,17 +132,54 @@ fn activate(app: &gtk4::Application, config: Rc<RefCell<Config>>) -> Result<()> 
         glib::ControlFlow::Continue
     });
 
-    // Show the window (present is required for layer-shell to work)
-    window.present();
-
     // Hide immediately if not always visible
     if !config.borrow().behavior.always_visible {
-        minimap.hide();
+        for minimap in minimaps.iter() {
+            minimap.hide();
+        }
     }
 
-    tracing::info!("Nirimap window created and displayed");
+    tracing::info!("Created {} nirimap monitor windows", minimaps.len());
 
     Ok(())
+}
+
+/// Create one minimap layer window for each monitor known to GDK.
+fn create_minimaps(
+    app: &gtk4::Application,
+    config: Rc<RefCell<Config>>,
+    state: Rc<RefCell<MinimapState>>,
+) -> Result<Vec<MinimapWidget>> {
+    let display = gtk4::gdk::Display::default().context("Could not get default display")?;
+    let monitors = display.monitors();
+    let mut minimaps = Vec::new();
+
+    for index in 0..monitors.n_items() {
+        let Some(object) = monitors.item(index) else {
+            continue;
+        };
+        let monitor = object
+            .downcast::<gtk4::gdk::Monitor>()
+            .map_err(|_| anyhow::anyhow!("Display monitor is not a GDK monitor"))?;
+        let Some(output) = monitor.connector().map(|connector| connector.to_string()) else {
+            tracing::warn!(
+                "Skipping monitor {} because it has no connector name",
+                index
+            );
+            continue;
+        };
+
+        let window = create_layer_window(app, &config.borrow(), &monitor);
+        let minimap = MinimapWidget::new(config.clone(), state.clone(), output.clone(), monitor);
+        minimap.set_window(window.clone());
+        window.set_child(Some(minimap.widget()));
+        window.present();
+
+        tracing::info!("Created nirimap for output {}", output);
+        minimaps.push(minimap);
+    }
+
+    Ok(minimaps)
 }
 
 /// Watch the config file for changes and send reload messages
@@ -195,11 +230,29 @@ fn watch_config_file(
     Ok(())
 }
 
-/// Apply a state update to the minimap
-fn apply_state_update(minimap: &MinimapWidget, update: StateUpdate) {
+fn update_shared_state<F>(minimaps: &[MinimapWidget], update: F)
+where
+    F: FnOnce(&mut MinimapState),
+{
+    if let Some(first) = minimaps.first() {
+        first.update_state(update);
+        for minimap in &minimaps[1..] {
+            minimap.refresh();
+        }
+    }
+}
+
+fn show_all(minimaps: &[MinimapWidget]) {
+    for minimap in minimaps {
+        minimap.show();
+    }
+}
+
+/// Apply a state update to every per-monitor minimap.
+fn apply_state_update(minimaps: &[MinimapWidget], update: StateUpdate) {
     match update {
         StateUpdate::FullState(new_state) => {
-            minimap.update_state(|state| {
+            update_shared_state(minimaps, |state| {
                 *state = new_state;
             });
             tracing::debug!("Applied full state update");
@@ -215,7 +268,7 @@ fn apply_state_update(minimap: &MinimapWidget, update: StateUpdate) {
             let mut is_new_window = false;
             let mut is_on_active_workspace = false;
 
-            minimap.update_state(|state| {
+            update_shared_state(minimaps, |state| {
                 // If this window is focused, clear focus from all other windows first
                 if is_focused {
                     state.set_focused_window(Some(window_id));
@@ -245,7 +298,9 @@ fn apply_state_update(minimap: &MinimapWidget, update: StateUpdate) {
             // Floating spawns are filtered by show_for_new_window when the
             // show_for_floating_windows opt-out is in effect.
             if is_on_active_workspace && is_new_window {
-                minimap.show_for_new_window(is_floating);
+                for minimap in minimaps {
+                    minimap.show_for_new_window(is_floating);
+                }
                 tracing::debug!(
                     "New window {} opened (focused: {}, floating: {})",
                     window_id,
@@ -258,34 +313,42 @@ fn apply_state_update(minimap: &MinimapWidget, update: StateUpdate) {
         }
 
         StateUpdate::WindowClosed(window_id) => {
-            minimap.update_state(|state| {
+            update_shared_state(minimaps, |state| {
                 state.remove_window(window_id);
             });
             tracing::debug!("Window {} closed", window_id);
         }
 
         StateUpdate::FocusChanged(window_id) => {
-            minimap.update_state(|state| {
+            update_shared_state(minimaps, |state| {
                 state.set_focused_window(window_id);
             });
             // Show the minimap only if focus changed to a different window
-            minimap.show_on_focus_change(window_id);
+            for minimap in minimaps {
+                minimap.show_on_focus_change(window_id);
+            }
             tracing::debug!("Focus changed to {:?}", window_id);
         }
 
         StateUpdate::WorkspaceActivated { id, focused } => {
             if focused {
-                minimap.update_state(|state| {
+                update_shared_state(minimaps, |state| {
                     state.set_active_workspace(id);
                 });
-                // Show the minimap when workspace changes (will auto-hide if configured)
-                minimap.show();
+            } else {
+                for minimap in minimaps {
+                    minimap.refresh();
+                }
+            }
+            // Show the minimap when workspace changes (will auto-hide if configured)
+            show_all(minimaps);
+            if focused {
                 tracing::debug!("Workspace {} activated", id);
             }
         }
 
         StateUpdate::WorkspacesChanged(workspaces) => {
-            minimap.update_state(|state| {
+            update_shared_state(minimaps, |state| {
                 state.replace_workspace_metadata(&workspaces);
             });
             tracing::debug!("Workspaces changed ({} total)", workspaces.len());
@@ -295,7 +358,7 @@ fn apply_state_update(minimap: &MinimapWidget, update: StateUpdate) {
             workspace_id,
             active_window_id,
         } => {
-            minimap.update_state(|state| {
+            update_shared_state(minimaps, |state| {
                 if let Some(ws) = state.workspaces.get_mut(&workspace_id) {
                     ws.active_window_id = active_window_id;
                 }
@@ -308,7 +371,7 @@ fn apply_state_update(minimap: &MinimapWidget, update: StateUpdate) {
         }
 
         StateUpdate::LayoutsChanged(layouts) => {
-            minimap.update_state(|state| {
+            update_shared_state(minimaps, |state| {
                 for (window_id, layout) in layouts {
                     // Find and update the window's layout
                     for workspace in state.workspaces.values_mut() {
@@ -328,7 +391,7 @@ fn apply_state_update(minimap: &MinimapWidget, update: StateUpdate) {
                 }
             });
             // Show the minimap when layouts change (window resize, move, etc.)
-            minimap.show();
+            show_all(minimaps);
             tracing::debug!("Window layouts changed");
         }
     }

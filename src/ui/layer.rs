@@ -5,7 +5,11 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use crate::config::{Anchor, Config};
 
 /// Create and configure a layer-shell window for the minimap
-pub fn create_layer_window(app: &Application, config: &Config) -> ApplicationWindow {
+pub fn create_layer_window(
+    app: &Application,
+    config: &Config,
+    monitor: &gtk4::gdk::Monitor,
+) -> ApplicationWindow {
     // Start with height from config; width will be set dynamically
     let window = ApplicationWindow::builder()
         .application(app)
@@ -22,6 +26,7 @@ pub fn create_layer_window(app: &Application, config: &Config) -> ApplicationWin
 
     // Initialize layer shell
     window.init_layer_shell();
+    window.set_monitor(Some(monitor));
 
     // Set the namespace for layer rules
     window.set_namespace(Some("nirimap"));
