@@ -1091,7 +1091,9 @@ fn draw_workspace_row_centered(
             }
 
             let is_highlighted = window.is_focused
-                || (overview_open && layout.workspace.active_window_id == Some(window.id));
+                || (overview_open
+                    && layout.workspace.is_active
+                    && layout.workspace.active_window_id == Some(window.id));
             let (fill_color, fill_alpha) = if is_highlighted {
                 (&focused_color, appearance.focused_opacity)
             } else {
@@ -1213,7 +1215,9 @@ fn draw_workspace_row_viewport(
             }
 
             let is_highlighted = window.is_focused
-                || (overview_open && layout.workspace.active_window_id == Some(window.id));
+                || (overview_open
+                    && layout.workspace.is_active
+                    && layout.workspace.active_window_id == Some(window.id));
             let (fill_color, fill_alpha) = if is_highlighted {
                 (&focused_color, appearance.focused_opacity)
             } else {
