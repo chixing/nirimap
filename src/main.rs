@@ -320,12 +320,24 @@ fn apply_state_update(minimaps: &[MinimapWidget], update: StateUpdate) {
         }
 
         StateUpdate::FocusChanged(window_id) => {
-            update_shared_state(minimaps, |state| {
-                state.set_focused_window(window_id);
-            });
-            // Show the minimap only if focus changed to a different window
-            for minimap in minimaps {
-                minimap.show_on_focus_change(window_id);
+            if let Some(window_id) = window_id {
+                // Niri reports no focused window while Overview owns focus.
+                // Keep the last focused tile highlighted so the minimap still
+                // shows where focus will return when Overview closes.
+                update_shared_state(minimaps, |state| {
+                    state.set_focused_window(Some(window_id));
+                });
+
+                // Show the minimap only if focus changed to a different window.
+                for minimap in minimaps {
+                    minimap.show_on_focus_change(Some(window_id));
+                }
+            } else {
+                // Do not clear the last focused tile when Niri's Overview is
+                // active; its focus is not a normal window focus.
+                for minimap in minimaps {
+                    minimap.refresh();
+                }
             }
             tracing::debug!("Focus changed to {:?}", window_id);
         }
