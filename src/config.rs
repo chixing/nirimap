@@ -266,6 +266,8 @@ impl Default for IconConfig {
 pub struct BehaviorConfig {
     /// Keep visible in Niri overview mode
     pub show_on_overview: bool,
+    /// Keep the process running but show the minimap only in Overview
+    pub overview_only: bool,
     /// Always show the minimap (if false, only shows on focus change)
     pub always_visible: bool,
     /// Milliseconds to keep minimap visible after focus change (only when always_visible is false)
@@ -281,6 +283,7 @@ impl Default for BehaviorConfig {
     fn default() -> Self {
         Self {
             show_on_overview: true,
+            overview_only: false,
             always_visible: true,
             hide_timeout_ms: 2000,
             show_for_floating_windows: false,
@@ -405,6 +408,7 @@ min_window_size = 16      # Skip icons on rectangles smaller than this (minimap 
 
 [behavior]
 show_on_overview = true        # Keep visible in Niri overview mode
+overview_only = false          # Keep running but show only while Overview is open
 always_visible = true          # Always show minimap (false = only on focus change)
 hide_timeout_ms = 2000         # Milliseconds before hiding after focus change
 show_for_floating_windows = false # When always_visible = false, surface the minimap for
@@ -500,6 +504,7 @@ mod tests {
 
         // Test behavior defaults
         assert!(config.behavior.show_on_overview);
+        assert!(!config.behavior.overview_only);
         assert!(config.behavior.always_visible);
         assert_eq!(config.behavior.hide_timeout_ms, 2000);
         assert!(!config.behavior.show_for_floating_windows);

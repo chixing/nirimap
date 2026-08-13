@@ -15,7 +15,7 @@ A minimal workspace minimap overlay for the [Niri](https://github.com/YaLTeR/nir
 - Empty minimap space remains click-through
 - Configurable appearance (colors, borders, gaps, opacity)
 - Application icons and text labels on window rectangles (configurable fonts, colors, positions)
-- Configurable visibility behavior (always visible or show on events)
+- Configurable visibility behavior (always visible, show on events, or Overview-only)
 - Hot-reloads configuration changes
 - Dynamic sizing based on workspace content
 - Creates one minimap overlay per connected monitor
@@ -131,7 +131,8 @@ opacity = 1.0             # Icon opacity (0.0 - 1.0)
 min_window_size = 16      # Skip icons on rectangles smaller than this (minimap pixels)
 
 [behavior]
-show_on_overview = true        # Keep visible in Niri overview mode (not yet implemented)
+show_on_overview = true        # Keep visible in Niri overview mode
+overview_only = false          # Keep running but show only while Overview is open
 always_visible = true          # Always show minimap (false = only on events)
 hide_timeout_ms = 2000         # Milliseconds before hiding after an event
 show_for_floating_windows = false # Surface the minimap for floating-window events
@@ -170,6 +171,11 @@ The configuration file is watched for changes. Most settings will apply immediat
 **Note**: Changing `anchor` or margins requires restarting nirimap.
 
 ### Visibility Behavior
+
+When `overview_only = true`, nirimap stays running in the background so its
+layer surfaces are ready immediately, but remains hidden until Niri Overview
+opens. It hides again when Overview closes, including when Overview is closed
+with a mouse click.
 
 When `always_visible = false`, the minimap will show temporarily when:
 
