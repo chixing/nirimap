@@ -67,9 +67,24 @@ where
             }
         };
 
+        let overview_closed = matches!(&event, Event::OverviewOpenedOrClosed { is_open: false });
+
         // Convert to state update
         if let Some(update) = event_to_update(event) {
             on_update(update);
+        }
+
+        // Niri emits the final normal-layout changes immediately after the
+        // Overview close event. Refreshing the complete state here prevents
+        // any incremental update that was skipped during Overview from
+        // leaving stale column/window positions in the minimap.
+        if overview_closed {
+            match fetch_initial_state() {
+                Ok(state) => on_update(StateUpdate::FullState(state)),
+                Err(err) => {
+                    tracing::warn!("Failed to refresh state after Overview closed: {}", err)
+                }
+            }
         }
     }
 
