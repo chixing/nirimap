@@ -71,7 +71,8 @@ impl MinimapWidget {
     /// Set the parent window (needed for dynamic resizing and visibility)
     pub fn set_window(&self, window: ApplicationWindow) {
         // Set initial visibility based on config
-        if !self.config.borrow().behavior.always_visible {
+        let behavior = &self.config.borrow().behavior;
+        if behavior.overview_only || !behavior.always_visible {
             window.set_visible(false);
         }
         let minimap = self.clone();
@@ -84,12 +85,17 @@ impl MinimapWidget {
 
     /// Show the minimap (with auto-hide timeout if configured)
     pub fn show(&self) {
+        let behavior = &self.config.borrow().behavior;
+        if behavior.overview_only && !self.overview_open.get() {
+            return;
+        }
+
         if let Some(window) = self.window.borrow().as_ref() {
             window.set_visible(true);
         }
 
         // If not always visible, schedule hide after timeout
-        if !self.config.borrow().behavior.always_visible {
+        if !behavior.always_visible && !behavior.overview_only {
             self.schedule_hide();
         }
     }
@@ -220,6 +226,14 @@ impl MinimapWidget {
         let was_open = self.overview_open.replace(is_open);
         if was_open == is_open {
             return;
+        }
+
+        if self.config.borrow().behavior.overview_only {
+            if is_open {
+                self.show();
+            } else {
+                self.hide();
+            }
         }
 
         if !is_open {

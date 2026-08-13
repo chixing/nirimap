@@ -132,8 +132,9 @@ fn activate(app: &gtk4::Application, config: Rc<RefCell<Config>>) -> Result<()> 
         glib::ControlFlow::Continue
     });
 
-    // Hide immediately if not always visible
-    if !config.borrow().behavior.always_visible {
+    // Keep the GTK/layer-shell process warm, but hide its surfaces until
+    // Overview opens when overview-only mode is enabled.
+    if config.borrow().behavior.overview_only || !config.borrow().behavior.always_visible {
         for minimap in minimaps.iter() {
             minimap.hide();
         }
