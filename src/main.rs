@@ -67,11 +67,12 @@ fn main() -> Result<()> {
 
 fn activate(app: &gtk4::Application, config: Rc<RefCell<Config>>) -> Result<()> {
     let state = Rc::new(RefCell::new(MinimapState::new()));
-    let minimaps = create_minimaps(app, config.clone(), state)?;
+    let minimaps = create_minimaps(app, config.clone(), state.clone())?;
     if minimaps.is_empty() {
         anyhow::bail!("No monitors with niri output names were found");
     }
-    let minimaps = Rc::new(minimaps);
+    let minimaps = MinimapSet::new(app.clone(), config.clone(), state.clone(), minimaps);
+    minimaps.watch_monitors()?;
 
     // Set up channel for state updates from IPC thread
     let (tx, rx) = mpsc::channel::<StateUpdate>();
@@ -107,7 +108,8 @@ fn activate(app: &gtk4::Application, config: Rc<RefCell<Config>>) -> Result<()> 
         // Process a batch of state updates
         for _ in 0..10 {
             if let Ok(update) = rx.try_recv() {
-                apply_state_update(&minimaps_clone, update);
+                let list = minimaps_clone.widgets();
+                apply_state_update(&minimaps_clone.state, &list, update);
             } else {
                 break;
             }
@@ -120,7 +122,7 @@ fn activate(app: &gtk4::Application, config: Rc<RefCell<Config>>) -> Result<()> 
 
             // Only reload if enough time has passed since the last reload
             if now.duration_since(*last_reload) >= config_reload_debounce {
-                for minimap in minimaps_clone.iter() {
+                for minimap in minimaps_clone.widgets().iter() {
                     minimap.reload_config();
                 }
                 *last_reload = now;
@@ -135,14 +137,58 @@ fn activate(app: &gtk4::Application, config: Rc<RefCell<Config>>) -> Result<()> 
     // Keep the GTK/layer-shell process warm, but hide its surfaces until
     // Overview opens when overview-only mode is enabled.
     if config.borrow().behavior.overview_only || !config.borrow().behavior.always_visible {
-        for minimap in minimaps.iter() {
+        for minimap in minimaps.widgets().iter() {
             minimap.hide();
         }
     }
 
-    tracing::info!("Created {} nirimap monitor windows", minimaps.len());
+    tracing::info!(
+        "Created {} nirimap monitor windows",
+        minimaps.widgets().len()
+    );
 
     Ok(())
+}
+
+/// Every monitor GDK currently knows about, paired with its connector name.
+///
+/// The name is `None` for a monitor GDK has added but not yet named -- the
+/// normal state for the first moment after an output is plugged in or
+/// re-enabled. Callers decide whether to wait for it or skip it.
+fn live_monitors() -> Result<Vec<(Option<String>, gtk4::gdk::Monitor)>> {
+    let display = gtk4::gdk::Display::default().context("Could not get default display")?;
+    let monitors = display.monitors();
+    let mut live = Vec::new();
+
+    for index in 0..monitors.n_items() {
+        let Some(object) = monitors.item(index) else {
+            continue;
+        };
+        let Ok(monitor) = object.downcast::<gtk4::gdk::Monitor>() else {
+            tracing::warn!("Display monitor {} is not a GDK monitor, skipping", index);
+            continue;
+        };
+        let output = monitor.connector().map(|connector| connector.to_string());
+        live.push((output, monitor));
+    }
+
+    Ok(live)
+}
+
+/// Build one minimap layer window bound to a single monitor.
+fn create_minimap_for_monitor(
+    app: &gtk4::Application,
+    config: &Rc<RefCell<Config>>,
+    state: &Rc<RefCell<MinimapState>>,
+    output: String,
+    monitor: gtk4::gdk::Monitor,
+) -> MinimapWidget {
+    let window = create_layer_window(app, &config.borrow(), &monitor);
+    let minimap = MinimapWidget::new(config.clone(), state.clone(), output, monitor);
+    minimap.set_window(window.clone());
+    window.set_child(Some(minimap.widget()));
+    window.present();
+    minimap
 }
 
 /// Create one minimap layer window for each monitor known to GDK.
@@ -151,36 +197,166 @@ fn create_minimaps(
     config: Rc<RefCell<Config>>,
     state: Rc<RefCell<MinimapState>>,
 ) -> Result<Vec<MinimapWidget>> {
-    let display = gtk4::gdk::Display::default().context("Could not get default display")?;
-    let monitors = display.monitors();
     let mut minimaps = Vec::new();
 
-    for index in 0..monitors.n_items() {
-        let Some(object) = monitors.item(index) else {
-            continue;
-        };
-        let monitor = object
-            .downcast::<gtk4::gdk::Monitor>()
-            .map_err(|_| anyhow::anyhow!("Display monitor is not a GDK monitor"))?;
-        let Some(output) = monitor.connector().map(|connector| connector.to_string()) else {
+    for (index, (output, monitor)) in live_monitors()?.into_iter().enumerate() {
+        let Some(output) = output else {
             tracing::warn!(
                 "Skipping monitor {} because it has no connector name",
                 index
             );
             continue;
         };
-
-        let window = create_layer_window(app, &config.borrow(), &monitor);
-        let minimap = MinimapWidget::new(config.clone(), state.clone(), output.clone(), monitor);
-        minimap.set_window(window.clone());
-        window.set_child(Some(minimap.widget()));
-        window.present();
-
         tracing::info!("Created nirimap for output {}", output);
-        minimaps.push(minimap);
+        minimaps.push(create_minimap_for_monitor(
+            app, &config, &state, output, monitor,
+        ));
     }
 
     Ok(minimaps)
+}
+
+/// The live set of per-monitor minimaps, kept in sync with GDK's monitor list.
+///
+/// Each minimap is pinned to one `gdk::Monitor`, and layer-shell binds a
+/// surface to its output at creation time. Disabling an output invalidates its
+/// monitor, so a surface can never be moved back onto it -- the minimap has to
+/// be dropped and rebuilt against the new monitor when the output returns.
+#[derive(Clone)]
+struct MinimapSet {
+    app: gtk4::Application,
+    config: Rc<RefCell<Config>>,
+    state: Rc<RefCell<MinimapState>>,
+    list: Rc<RefCell<Vec<MinimapWidget>>>,
+    /// Monitors that arrived without a connector name yet. GDK adds a monitor
+    /// to the list before the Wayland output's name event lands, so the first
+    /// reconcile after a hotplug usually cannot identify it.
+    pending: Rc<RefCell<Vec<gtk4::gdk::Monitor>>>,
+}
+
+impl MinimapSet {
+    fn new(
+        app: gtk4::Application,
+        config: Rc<RefCell<Config>>,
+        state: Rc<RefCell<MinimapState>>,
+        minimaps: Vec<MinimapWidget>,
+    ) -> Self {
+        Self {
+            app,
+            config,
+            state,
+            list: Rc::new(RefCell::new(minimaps)),
+            pending: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    fn widgets(&self) -> std::cell::Ref<'_, Vec<MinimapWidget>> {
+        self.list.borrow()
+    }
+
+    /// Reconcile whenever outputs are enabled or disabled.
+    fn watch_monitors(&self) -> Result<()> {
+        let display = gtk4::gdk::Display::default().context("Could not get default display")?;
+        let this = self.clone();
+        display
+            .monitors()
+            .connect_items_changed(move |_, position, removed, added| {
+                tracing::info!(
+                    "Monitor list changed at {} (-{} +{}), reconciling minimaps",
+                    position,
+                    removed,
+                    added
+                );
+                this.reconcile();
+            });
+        Ok(())
+    }
+
+    /// Drop minimaps whose output went away, and build one for every output
+    /// that doesn't have a live minimap yet.
+    fn reconcile(&self) {
+        let live = match live_monitors() {
+            Ok(live) => live,
+            Err(e) => {
+                tracing::error!("Could not enumerate monitors: {}", e);
+                return;
+            }
+        };
+
+        // Collected while the list is borrowed, torn down after it is released
+        // so GTK signals from destroy() can't re-enter a borrowed list.
+        let mut stale = Vec::new();
+
+        {
+            let mut current = self.list.borrow_mut();
+
+            current.retain(|minimap| {
+                let still_present = live
+                    .iter()
+                    .any(|(output, _)| output.as_deref() == Some(minimap.output()));
+                if !still_present {
+                    stale.push(minimap.clone());
+                }
+                still_present
+            });
+
+            // A minimap created while Overview is open must come up visible.
+            let overview_open = self.state.borrow().overview_open;
+
+            for (output, monitor) in &live {
+                let Some(output) = output else {
+                    self.watch_for_connector(monitor);
+                    continue;
+                };
+                if current.iter().any(|m| m.output() == output) {
+                    continue;
+                }
+
+                let minimap = create_minimap_for_monitor(
+                    &self.app,
+                    &self.config,
+                    &self.state,
+                    output.clone(),
+                    monitor.clone(),
+                );
+                minimap.set_overview_open(overview_open);
+                minimap.refresh();
+
+                tracing::info!("Created nirimap for output {}", output);
+                current.push(minimap);
+            }
+        }
+
+        for minimap in stale {
+            tracing::info!("Removed nirimap for output {}", minimap.output());
+            minimap.close();
+        }
+    }
+
+    /// Reconcile again once a freshly-added monitor learns its connector name.
+    ///
+    /// `items-changed` fires as soon as GDK appends the monitor, which is
+    /// before the compositor has sent the output's name. Reconciling only on
+    /// that signal would silently skip every re-enabled output.
+    fn watch_for_connector(&self, monitor: &gtk4::gdk::Monitor) {
+        let mut pending = self.pending.borrow_mut();
+        if pending.iter().any(|m| m == monitor) {
+            return;
+        }
+        pending.push(monitor.clone());
+        drop(pending);
+
+        tracing::debug!("Monitor has no connector name yet, waiting for it");
+
+        let this = self.clone();
+        monitor.connect_connector_notify(move |monitor| {
+            if monitor.connector().is_none() {
+                return;
+            }
+            this.pending.borrow_mut().retain(|m| m != monitor);
+            this.reconcile();
+        });
+    }
 }
 
 /// Watch the config file for changes and send reload messages
@@ -231,15 +407,18 @@ fn watch_config_file(
     Ok(())
 }
 
-fn update_shared_state<F>(minimaps: &[MinimapWidget], update: F)
+/// Apply an update to the shared state, then redraw every minimap.
+///
+/// The state is updated directly rather than through a widget: the minimap
+/// list is empty whenever every output is disabled, and dropping updates in
+/// that window would leave the state stale for whichever monitor comes back.
+fn update_shared_state<F>(state: &Rc<RefCell<MinimapState>>, minimaps: &[MinimapWidget], update: F)
 where
     F: FnOnce(&mut MinimapState),
 {
-    if let Some(first) = minimaps.first() {
-        first.update_state(update);
-        for minimap in &minimaps[1..] {
-            minimap.refresh();
-        }
+    update(&mut state.borrow_mut());
+    for minimap in minimaps {
+        minimap.refresh();
     }
 }
 
@@ -250,10 +429,14 @@ fn show_all(minimaps: &[MinimapWidget]) {
 }
 
 /// Apply a state update to every per-monitor minimap.
-fn apply_state_update(minimaps: &[MinimapWidget], update: StateUpdate) {
+fn apply_state_update(
+    state: &Rc<RefCell<MinimapState>>,
+    minimaps: &[MinimapWidget],
+    update: StateUpdate,
+) {
     match update {
         StateUpdate::FullState(new_state) => {
-            update_shared_state(minimaps, |state| {
+            update_shared_state(state, minimaps, |state| {
                 *state = new_state;
             });
             tracing::debug!("Applied full state update");
@@ -269,7 +452,7 @@ fn apply_state_update(minimaps: &[MinimapWidget], update: StateUpdate) {
             let mut is_new_window = false;
             let mut is_on_active_workspace = false;
 
-            update_shared_state(minimaps, |state| {
+            update_shared_state(state, minimaps, |state| {
                 // If this window is focused, clear focus from all other windows first
                 if is_focused {
                     state.set_focused_window(Some(window_id));
@@ -314,14 +497,14 @@ fn apply_state_update(minimaps: &[MinimapWidget], update: StateUpdate) {
         }
 
         StateUpdate::WindowClosed(window_id) => {
-            update_shared_state(minimaps, |state| {
+            update_shared_state(state, minimaps, |state| {
                 state.remove_window(window_id);
             });
             tracing::debug!("Window {} closed", window_id);
         }
 
         StateUpdate::FocusChanged(window_id) => {
-            update_shared_state(minimaps, |state| {
+            update_shared_state(state, minimaps, |state| {
                 state.set_focused_window(window_id);
             });
             // Show the minimap only if focus changed to a different window
@@ -332,7 +515,7 @@ fn apply_state_update(minimaps: &[MinimapWidget], update: StateUpdate) {
         }
 
         StateUpdate::OverviewChanged(is_open) => {
-            update_shared_state(minimaps, |state| {
+            update_shared_state(state, minimaps, |state| {
                 state.overview_open = is_open;
             });
             for minimap in minimaps {
@@ -343,7 +526,7 @@ fn apply_state_update(minimaps: &[MinimapWidget], update: StateUpdate) {
 
         StateUpdate::WorkspaceActivated { id, focused } => {
             if focused {
-                update_shared_state(minimaps, |state| {
+                update_shared_state(state, minimaps, |state| {
                     state.set_active_workspace(id);
                 });
             } else {
@@ -359,7 +542,7 @@ fn apply_state_update(minimaps: &[MinimapWidget], update: StateUpdate) {
         }
 
         StateUpdate::WorkspacesChanged(workspaces) => {
-            update_shared_state(minimaps, |state| {
+            update_shared_state(state, minimaps, |state| {
                 state.replace_workspace_metadata(&workspaces);
             });
             tracing::debug!("Workspaces changed ({} total)", workspaces.len());
@@ -369,7 +552,7 @@ fn apply_state_update(minimaps: &[MinimapWidget], update: StateUpdate) {
             workspace_id,
             active_window_id,
         } => {
-            update_shared_state(minimaps, |state| {
+            update_shared_state(state, minimaps, |state| {
                 if let Some(ws) = state.workspaces.get_mut(&workspace_id) {
                     ws.active_window_id = active_window_id;
                 }
@@ -383,7 +566,7 @@ fn apply_state_update(minimaps: &[MinimapWidget], update: StateUpdate) {
 
         StateUpdate::LayoutsChanged(layouts) => {
             let mut skipped_for_overview = false;
-            update_shared_state(minimaps, |state| {
+            update_shared_state(state, minimaps, |state| {
                 if state.overview_open {
                     skipped_for_overview = true;
                     return;

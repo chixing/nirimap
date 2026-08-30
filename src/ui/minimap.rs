@@ -203,13 +203,21 @@ impl MinimapWidget {
         &self.drawing_area
     }
 
-    /// Update the state, resize if needed, and trigger a redraw
-    pub fn update_state<F>(&self, f: F)
-    where
-        F: FnOnce(&mut MinimapState),
-    {
-        f(&mut self.state.borrow_mut());
-        self.refresh_geometry_and_draw();
+    /// The niri output (connector) name this minimap is bound to.
+    pub fn output(&self) -> &str {
+        &self.output
+    }
+
+    /// Tear down this minimap's layer surface.
+    ///
+    /// Used when the output disappears. The `gdk::Monitor` held by this widget
+    /// is invalidated at that point, so the surface can never be repositioned
+    /// correctly again -- it has to be recreated against the new monitor.
+    pub fn close(&self) {
+        self.cancel_hide_timeout();
+        if let Some(window) = self.window.borrow_mut().take() {
+            window.destroy();
+        }
     }
 
     /// Recalculate the size and redraw after a shared state update.
