@@ -5,7 +5,9 @@ mod ui;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,6 +26,14 @@ const APP_ID: &str = "com.github.nirimap";
 /// Debounce duration for config reloads in milliseconds
 /// Prevents excessive reloads when config file is modified multiple times rapidly
 const CONFIG_RELOAD_DEBOUNCE_MS: u64 = 500;
+
+/// Backoff bounds for reconnecting to niri's event stream.
+const IPC_RECONNECT_MIN: Duration = Duration::from_millis(250);
+const IPC_RECONNECT_MAX: Duration = Duration::from_secs(30);
+
+/// How long a connection must last before it counts as healthy and the
+/// reconnect backoff resets.
+const IPC_CONNECTION_STABLE: Duration = Duration::from_secs(30);
 
 /// Messages for config reload
 enum ConfigMessage {
@@ -65,6 +75,53 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Stay subscribed to niri's event stream, reconnecting when it drops.
+///
+/// The event stream is the only source of minimap state. Letting the thread
+/// exit on a disconnect leaves the overlay running but frozen on stale
+/// windows, with nothing in the log to say why -- so retry instead, and say so
+/// each time. `run_event_loop` re-fetches full state on every connection, so a
+/// reconnect resyncs the UI on its own.
+fn run_ipc_with_reconnect(tx: mpsc::Sender<StateUpdate>) {
+    let mut backoff = IPC_RECONNECT_MIN;
+
+    loop {
+        let ui_gone = Arc::new(AtomicBool::new(false));
+        let started = Instant::now();
+
+        let result = {
+            let tx = tx.clone();
+            let ui_gone = ui_gone.clone();
+            ipc::run_event_loop(move |update| {
+                if tx.send(update).is_err() {
+                    ui_gone.store(true, Ordering::Relaxed);
+                }
+            })
+        };
+
+        // The receiver is dropped when the UI shuts down; nothing left to feed.
+        if ui_gone.load(Ordering::Relaxed) {
+            tracing::info!("UI is gone, stopping IPC event loop");
+            return;
+        }
+
+        match result {
+            Ok(()) => tracing::warn!("Niri closed the event stream"),
+            Err(e) => tracing::warn!("IPC event loop error: {}", e),
+        }
+
+        // A connection that survived a while was healthy; don't punish it with
+        // the backoff a rapid reconnect loop has built up.
+        if started.elapsed() >= IPC_CONNECTION_STABLE {
+            backoff = IPC_RECONNECT_MIN;
+        }
+
+        tracing::info!("Reconnecting to niri in {:?}", backoff);
+        thread::sleep(backoff);
+        backoff = (backoff * 2).min(IPC_RECONNECT_MAX);
+    }
+}
+
 fn activate(app: &gtk4::Application, config: Rc<RefCell<Config>>) -> Result<()> {
     let state = Rc::new(RefCell::new(MinimapState::new()));
     let minimaps = create_minimaps(app, config.clone(), state.clone())?;
@@ -78,15 +135,7 @@ fn activate(app: &gtk4::Application, config: Rc<RefCell<Config>>) -> Result<()> 
     let (tx, rx) = mpsc::channel::<StateUpdate>();
 
     // Start IPC event loop in a background thread
-    thread::spawn(move || {
-        if let Err(e) = ipc::run_event_loop(move |update| {
-            if tx.send(update).is_err() {
-                tracing::warn!("Failed to send state update, receiver dropped");
-            }
-        }) {
-            tracing::error!("IPC event loop error: {}", e);
-        }
-    });
+    thread::spawn(move || run_ipc_with_reconnect(tx));
 
     // Set up channel for config reload messages
     let (config_tx, config_rx) = mpsc::channel::<ConfigMessage>();
