@@ -55,8 +55,8 @@ pub struct MinimapState {
     pub active_workspace_id: Option<u64>,
     /// Currently focused window ID
     pub focused_window_id: Option<u64>,
-    /// Whether Niri Overview is currently open. Temporary Overview layout
-    /// changes are ignored so the minimap keeps its pre-Overview geometry.
+    /// Whether Niri Overview is currently open. Outer layer dimensions
+    /// remain stable during Overview while window layouts update interactively.
     pub overview_open: bool,
 }
 

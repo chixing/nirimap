@@ -521,9 +521,16 @@ fn apply_state_update(
                     let workspace = state
                         .workspaces
                         .entry(ws_id)
-                        .or_insert_with(Default::default);
+                        .or_insert_with(|| state::Workspace {
+                            id: ws_id,
+                            ..Default::default()
+                        });
                     is_new_window = !workspace.windows.contains_key(&window_id);
                     workspace.windows.insert(window_id, window);
+                } else {
+                    for workspace in state.workspaces.values_mut() {
+                        workspace.windows.remove(&window_id);
+                    }
                 }
             });
 
@@ -614,13 +621,7 @@ fn apply_state_update(
         }
 
         StateUpdate::LayoutsChanged(layouts) => {
-            let mut skipped_for_overview = false;
             update_shared_state(state, minimaps, |state| {
-                if state.overview_open {
-                    skipped_for_overview = true;
-                    return;
-                }
-
                 for (window_id, layout) in layouts {
                     // Find and update the window's layout
                     for workspace in state.workspaces.values_mut() {
@@ -639,13 +640,9 @@ fn apply_state_update(
                     }
                 }
             });
-            if skipped_for_overview {
-                tracing::debug!("Skipped temporary Overview window layouts");
-            } else {
-                // Show the minimap when layouts change (window resize, move, etc.)
-                show_all(minimaps);
-                tracing::debug!("Window layouts changed");
-            }
+            // Show the minimap when layouts change (window resize, move, etc.)
+            show_all(minimaps);
+            tracing::debug!("Window layouts changed");
         }
     }
 }
@@ -731,5 +728,139 @@ mod tests {
 
         // Now we should get a reload
         assert_eq!(reload_count, 1);
+    }
+
+    fn test_ipc_window_layout(col: usize, win_idx: usize, w: f64, h: f64) -> niri_ipc::WindowLayout {
+        niri_ipc::WindowLayout {
+            pos_in_scrolling_layout: Some((col, win_idx)),
+            tile_size: (w, h),
+            window_size: (w as i32, h as i32),
+            tile_pos_in_workspace_view: None,
+            window_offset_in_tile: (0.0, 0.0),
+        }
+    }
+
+    #[test]
+    fn test_layouts_changed_applied_during_overview() {
+        let state = Rc::new(RefCell::new(MinimapState::new()));
+        let minimaps: Vec<MinimapWidget> = Vec::new();
+
+        // Add two windows in workspace 1, column 1 (1-based from niri)
+        let win1 = state::Window {
+            id: 1,
+            pos: None,
+            size: (100.0, 50.0),
+            column_index: 0,
+            window_index: 0,
+            is_focused: false,
+            is_floating: false,
+            title: None,
+            app_id: None,
+        };
+        let win2 = state::Window {
+            id: 2,
+            pos: None,
+            size: (100.0, 50.0),
+            column_index: 0,
+            window_index: 1,
+            is_focused: false,
+            is_floating: false,
+            title: None,
+            app_id: None,
+        };
+        apply_state_update(
+            &state,
+            &minimaps,
+            StateUpdate::WindowChanged {
+                window: win1,
+                workspace_id: Some(1),
+            },
+        );
+        apply_state_update(
+            &state,
+            &minimaps,
+            StateUpdate::WindowChanged {
+                window: win2,
+                workspace_id: Some(1),
+            },
+        );
+
+        // Enter Overview mode
+        apply_state_update(&state, &minimaps, StateUpdate::OverviewChanged(true));
+        assert!(state.borrow().overview_open);
+
+        // Move win2 UP and win1 DOWN (swap vertical positions in column) while in Overview
+        let layout_win1 = test_ipc_window_layout(1, 2, 100.0, 60.0);
+        let layout_win2 = test_ipc_window_layout(1, 1, 100.0, 40.0);
+        apply_state_update(
+            &state,
+            &minimaps,
+            StateUpdate::LayoutsChanged(vec![(1, layout_win1), (2, layout_win2)]),
+        );
+
+        let ws = state.borrow().workspaces.get(&1).cloned().unwrap();
+        let w1 = ws.windows.get(&1).unwrap();
+        let w2 = ws.windows.get(&2).unwrap();
+
+        // win1 should now be at window_index 1, win2 at window_index 0
+        assert_eq!(w1.column_index, 0);
+        assert_eq!(w1.window_index, 1);
+        assert_eq!(w1.size, (100.0, 60.0));
+
+        assert_eq!(w2.column_index, 0);
+        assert_eq!(w2.window_index, 0);
+        assert_eq!(w2.size, (100.0, 40.0));
+    }
+
+    #[test]
+    fn test_window_changed_workspace_move_and_none() {
+        let state = Rc::new(RefCell::new(MinimapState::new()));
+        let minimaps: Vec<MinimapWidget> = Vec::new();
+
+        let win = state::Window {
+            id: 10,
+            pos: None,
+            size: (100.0, 100.0),
+            column_index: 0,
+            window_index: 0,
+            is_focused: false,
+            is_floating: false,
+            title: None,
+            app_id: None,
+        };
+
+        // Window appears in workspace 1
+        apply_state_update(
+            &state,
+            &minimaps,
+            StateUpdate::WindowChanged {
+                window: win.clone(),
+                workspace_id: Some(1),
+            },
+        );
+        assert!(state.borrow().workspaces.get(&1).unwrap().windows.contains_key(&10));
+
+        // Window moves to workspace 2
+        apply_state_update(
+            &state,
+            &minimaps,
+            StateUpdate::WindowChanged {
+                window: win.clone(),
+                workspace_id: Some(2),
+            },
+        );
+        assert!(!state.borrow().workspaces.get(&1).unwrap().windows.contains_key(&10));
+        assert!(state.borrow().workspaces.get(&2).unwrap().windows.contains_key(&10));
+
+        // Window workspace becomes None (unmapped/removed)
+        apply_state_update(
+            &state,
+            &minimaps,
+            StateUpdate::WindowChanged {
+                window: win,
+                workspace_id: None,
+            },
+        );
+        assert!(!state.borrow().workspaces.get(&2).unwrap().windows.contains_key(&10));
     }
 }

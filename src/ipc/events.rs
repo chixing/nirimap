@@ -75,9 +75,8 @@ where
         }
 
         // Niri emits the final normal-layout changes immediately after the
-        // Overview close event. Refreshing the complete state here prevents
-        // any incremental update that was skipped during Overview from
-        // leaving stale column/window positions in the minimap.
+        // Overview close event. Fetching full state ensures geometry is fully
+        // resynced once Overview closes.
         if overview_closed {
             match fetch_initial_state() {
                 Ok(state) => on_update(StateUpdate::FullState(state)),
