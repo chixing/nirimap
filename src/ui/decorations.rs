@@ -14,9 +14,6 @@ use crate::config::{
 };
 use crate::state::Window;
 
-/// Inset from the window edge for icons anchored at a corner/edge.
-const ICON_EDGE_INSET: f64 = 2.0;
-
 /// Horizontal placement derived from an anchor.
 enum HAlign {
     Left,
@@ -213,15 +210,16 @@ fn draw_window_icon(
         return;
     }
 
+    let inset = icons.padding;
     let ix = match anchor_h(icons.position) {
-        HAlign::Left => x + ICON_EDGE_INSET,
+        HAlign::Left => x + inset,
         HAlign::Center => x + (w - size) / 2.0,
-        HAlign::Right => x + w - size - ICON_EDGE_INSET,
+        HAlign::Right => x + w - size - inset,
     };
     let iy = match anchor_v(icons.position) {
-        VAlign::Top => y + ICON_EDGE_INSET,
+        VAlign::Top => y + inset,
         VAlign::Center => y + (h - size) / 2.0,
-        VAlign::Bottom => y + h - size - ICON_EDGE_INSET,
+        VAlign::Bottom => y + h - size - inset,
     };
 
     let opacity = icons.opacity.clamp(0.0, 1.0);

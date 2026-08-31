@@ -239,6 +239,8 @@ pub struct IconConfig {
     pub size: IconSize,
     /// Anchor position within the window rectangle
     pub position: Anchor,
+    /// Inner padding between icon and window edge
+    pub padding: f64,
     /// Icon opacity (0.0 - 1.0)
     pub opacity: f64,
     /// GTK icon theme name to use instead of the system default
@@ -253,6 +255,7 @@ impl Default for IconConfig {
             enabled: true,
             size: IconSize::Auto,
             position: Anchor::Center,
+            padding: 2.0,
             opacity: 1.0,
             theme_override: None,
             min_window_size: 16.0,
@@ -402,6 +405,7 @@ shadow = false            # Dark drop shadow behind text for legibility
 enabled = true            # Draw application icons on window rectangles
 size = "auto"             # "auto" (scales with the rectangle) or explicit pixels, e.g. 16
 position = "center"       # Anchor within the window rectangle (same options as labels)
+padding = 2               # Inner padding between icon and window edge
 opacity = 1.0             # Icon opacity (0.0 - 1.0)
 # theme_override = "Papirus" # GTK icon theme name (defaults to system theme)
 min_window_size = 16      # Skip icons on rectangles smaller than this (minimap pixels)
@@ -498,6 +502,7 @@ mod tests {
         assert!(config.icons.enabled);
         assert_eq!(config.icons.size, IconSize::Auto);
         assert_eq!(config.icons.position, Anchor::Center);
+        assert_eq!(config.icons.padding, 2.0);
         assert_eq!(config.icons.opacity, 1.0);
         assert_eq!(config.icons.theme_override, None);
         assert_eq!(config.icons.min_window_size, 16.0);
@@ -552,6 +557,7 @@ mod tests {
             enabled = false
             size = 24
             position = "bottom-right"
+            padding = 5
             opacity = 0.5
             theme_override = "Papirus"
             min_window_size = 10
@@ -560,6 +566,7 @@ mod tests {
         assert!(!config.icons.enabled);
         assert_eq!(config.icons.size, IconSize::Pixels(24.0));
         assert_eq!(config.icons.position, Anchor::BottomRight);
+        assert_eq!(config.icons.padding, 5.0);
         assert_eq!(config.icons.opacity, 0.5);
         assert_eq!(config.icons.theme_override.as_deref(), Some("Papirus"));
         assert_eq!(config.icons.min_window_size, 10.0);
@@ -602,6 +609,7 @@ mod tests {
         );
         assert_eq!(config.icons.enabled, defaults.icons.enabled);
         assert_eq!(config.icons.size, defaults.icons.size);
+        assert_eq!(config.icons.padding, defaults.icons.padding);
         assert_eq!(config.icons.opacity, defaults.icons.opacity);
         assert_eq!(config.icons.theme_override, defaults.icons.theme_override);
         assert_eq!(
