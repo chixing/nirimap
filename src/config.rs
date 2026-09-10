@@ -46,6 +46,49 @@ pub struct DisplayConfig {
     pub margin_y: i32,
     /// Which workspaces to display
     pub workspace_mode: WorkspaceMode,
+    /// Row height override for portrait monitors. A row's drawn width follows the
+    /// monitor's aspect ratio, so a portrait output renders the same `height` far
+    /// narrower than a landscape one (100px tall is 178px wide at 16:9, but only
+    /// 56px wide at 9:16). Unset falls back to `height`.
+    pub portrait_height: Option<u32>,
+    /// `max_width_percent` override for portrait monitors. Unset falls back to
+    /// `max_width_percent`.
+    pub portrait_max_width_percent: Option<f64>,
+    /// `max_height_percent` override for portrait monitors. Unset falls back to
+    /// `max_height_percent`.
+    pub portrait_max_height_percent: Option<f64>,
+}
+
+/// Whether a monitor of this logical size is taller than it is wide.
+/// Logical size already accounts for niri's output `transform`.
+pub fn is_portrait(viewport_width: f64, viewport_height: f64) -> bool {
+    viewport_height > viewport_width
+}
+
+impl DisplayConfig {
+    /// Row height to use on a monitor of the given logical size.
+    pub fn height_for(&self, viewport_width: f64, viewport_height: f64) -> u32 {
+        match self.portrait_height {
+            Some(h) if is_portrait(viewport_width, viewport_height) => h,
+            _ => self.height,
+        }
+    }
+
+    /// Width cap (fraction of monitor width) for a monitor of the given logical size.
+    pub fn max_width_percent_for(&self, viewport_width: f64, viewport_height: f64) -> f64 {
+        match self.portrait_max_width_percent {
+            Some(v) if is_portrait(viewport_width, viewport_height) => v,
+            _ => self.max_width_percent,
+        }
+    }
+
+    /// Height cap (fraction of monitor height) for a monitor of the given logical size.
+    pub fn max_height_percent_for(&self, viewport_width: f64, viewport_height: f64) -> f64 {
+        match self.portrait_max_height_percent {
+            Some(v) if is_portrait(viewport_width, viewport_height) => v,
+            _ => self.max_height_percent,
+        }
+    }
 }
 
 impl Default for DisplayConfig {
@@ -58,6 +101,9 @@ impl Default for DisplayConfig {
             margin_x: 10,
             margin_y: 10,
             workspace_mode: WorkspaceMode::default(),
+            portrait_height: None,
+            portrait_max_width_percent: None,
+            portrait_max_height_percent: None,
         }
     }
 }
@@ -362,6 +408,14 @@ height = 100              # Per-workspace row height in pixels
                           # In "all" mode: height of one workspace row
 max_width_percent = 0.5   # Maximum width as fraction of screen (0.0 - 1.0)
 max_height_percent = 0.8  # Maximum height as fraction of screen (used in "all" mode)
+
+# Portrait (vertical) monitor overrides. A row's drawn width follows the monitor's
+# aspect ratio, so the same `height` renders much narrower on a rotated display:
+# 100px tall is 178px wide on a 2560x1440 monitor, but only 56px wide on 1080x1920.
+# Uncomment to size vertical monitors independently; unset means "use the value above".
+# portrait_height = 180
+# portrait_max_width_percent = 0.9
+# portrait_max_height_percent = 0.8
 anchor = "top-right"      # Position: top-left, top-center, top-right,
                           #           bottom-left, bottom-center, bottom-right, center
 margin_x = 10             # Horizontal margin from edge
@@ -513,6 +567,74 @@ mod tests {
         assert!(config.behavior.always_visible);
         assert_eq!(config.behavior.hide_timeout_ms, 2000);
         assert!(!config.behavior.show_for_floating_windows);
+    }
+
+    #[test]
+    fn portrait_overrides_default_to_none() {
+        let display = DisplayConfig::default();
+        assert_eq!(display.portrait_height, None);
+        assert_eq!(display.portrait_max_width_percent, None);
+        assert_eq!(display.portrait_max_height_percent, None);
+    }
+
+    #[test]
+    fn portrait_detection_uses_logical_size() {
+        assert!(is_portrait(1080.0, 1920.0));
+        assert!(!is_portrait(2560.0, 1440.0));
+        // A square monitor is not portrait.
+        assert!(!is_portrait(1440.0, 1440.0));
+    }
+
+    #[test]
+    fn unset_portrait_overrides_fall_back_to_shared_values() {
+        let display = DisplayConfig::default();
+        // Portrait monitor, but no overrides set: same values as landscape.
+        assert_eq!(display.height_for(1080.0, 1920.0), display.height);
+        assert_eq!(
+            display.max_width_percent_for(1080.0, 1920.0),
+            display.max_width_percent
+        );
+        assert_eq!(
+            display.max_height_percent_for(1080.0, 1920.0),
+            display.max_height_percent
+        );
+    }
+
+    #[test]
+    fn portrait_overrides_apply_only_to_portrait_monitors() {
+        let display = DisplayConfig {
+            portrait_height: Some(180),
+            portrait_max_width_percent: Some(0.9),
+            portrait_max_height_percent: Some(0.7),
+            ..DisplayConfig::default()
+        };
+
+        // Portrait: overrides win.
+        assert_eq!(display.height_for(1080.0, 1920.0), 180);
+        assert_eq!(display.max_width_percent_for(1080.0, 1920.0), 0.9);
+        assert_eq!(display.max_height_percent_for(1080.0, 1920.0), 0.7);
+
+        // Landscape: untouched.
+        assert_eq!(display.height_for(2560.0, 1440.0), 100);
+        assert_eq!(display.max_width_percent_for(2560.0, 1440.0), 0.5);
+        assert_eq!(display.max_height_percent_for(2560.0, 1440.0), 0.8);
+    }
+
+    #[test]
+    fn portrait_overrides_parse_from_toml() {
+        let toml = r#"
+[display]
+height = 100
+portrait_height = 200
+portrait_max_width_percent = 0.95
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.display.height, 100);
+        assert_eq!(config.display.portrait_height, Some(200));
+        assert_eq!(config.display.portrait_max_width_percent, Some(0.95));
+        // Not specified -> stays None, so portrait uses the shared value.
+        assert_eq!(config.display.portrait_max_height_percent, None);
+        assert_eq!(config.display.max_height_percent_for(1080.0, 1920.0), 0.8);
     }
 
     #[test]

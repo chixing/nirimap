@@ -293,12 +293,13 @@ impl MinimapWidget {
     /// Get monitor-based caps for widget width and height.
     fn get_monitor_caps(&self) -> (f64, f64) {
         let display_cfg = &self.config.borrow().display;
-        let max_width_percent = display_cfg.max_width_percent;
-        let max_height_percent = display_cfg.max_height_percent;
+        let (viewport_width, viewport_height) = monitor_logical_size(&self.monitor);
+        let max_width_percent = display_cfg.max_width_percent_for(viewport_width, viewport_height);
+        let max_height_percent =
+            display_cfg.max_height_percent_for(viewport_width, viewport_height);
 
-        let geometry = self.monitor.geometry();
-        let w = geometry.width() as f64 * max_width_percent;
-        let h = geometry.height() as f64 * max_height_percent;
+        let w = viewport_width * max_width_percent;
+        let h = viewport_height * max_height_percent;
         (w, h)
     }
 
@@ -740,7 +741,7 @@ fn compute_all_mode_geometry(
     viewport_width: f64,
     viewport_height: f64,
 ) -> AllModeGeometry {
-    let row_height_cfg = display.height as f64;
+    let row_height_cfg = display.height_for(viewport_width, viewport_height) as f64;
     let min_widget_width = aspect_ratio_min_width(row_height_cfg, viewport_width, viewport_height);
 
     let n = rows.len().max(1) as f64;
@@ -826,7 +827,7 @@ fn compute_widget_dimensions(
     viewport_height: f64,
     output: &str,
 ) -> WidgetDimensions {
-    let row_height_cfg = display.height as f64;
+    let row_height_cfg = display.height_for(viewport_width, viewport_height) as f64;
     let min_widget_width = aspect_ratio_min_width(row_height_cfg, viewport_width, viewport_height);
 
     match display.workspace_mode {
