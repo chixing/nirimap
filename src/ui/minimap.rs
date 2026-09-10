@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use gtk4::cairo::{Context, Operator, RectangleInt, Region};
@@ -27,6 +28,10 @@ pub struct MinimapWidget {
     /// Whether Niri Overview is currently open. Geometry is held stable while
     /// Overview emits its temporary layout changes.
     overview_open: Rc<Cell<bool>>,
+    /// Structural signature of the layout at the time `update_size` last ran.
+    /// Used to tell a real window move from Overview's transient cell-size
+    /// animation, so geometry can stay frozen for the latter but not the former.
+    last_size_signature: Rc<Cell<u64>>,
     /// Track the last window ID that triggered a show via focus change
     last_shown_focus_id: Rc<Cell<Option<u64>>>,
     /// Cache of resolved application icons, cleared on config reload
@@ -59,6 +64,7 @@ impl MinimapWidget {
             window: Rc::new(RefCell::new(None)),
             hide_timeout_id: Rc::new(Cell::new(None)),
             overview_open: Rc::new(Cell::new(false)),
+            last_size_signature: Rc::new(Cell::new(0)),
             last_shown_focus_id: Rc::new(Cell::new(None)),
             icon_cache: Rc::new(RefCell::new(IconCache::new())),
         };
@@ -95,8 +101,11 @@ impl MinimapWidget {
         }
 
         // If not always visible, schedule hide after timeout
+        // (unless we are in Overview and show_on_overview is enabled)
         if !behavior.always_visible && !behavior.overview_only {
-            self.schedule_hide();
+            if !(behavior.show_on_overview && self.overview_open.get()) {
+                self.schedule_hide();
+            }
         }
     }
 
@@ -236,10 +245,20 @@ impl MinimapWidget {
             return;
         }
 
-        if self.config.borrow().behavior.overview_only {
+        let behavior = self.config.borrow().behavior.clone();
+        if behavior.overview_only {
             if is_open {
                 self.show();
             } else {
+                self.hide();
+            }
+        } else if behavior.show_on_overview {
+            if is_open {
+                self.cancel_hide_timeout();
+                if let Some(window) = self.window.borrow().as_ref() {
+                    window.set_visible(true);
+                }
+            } else if !behavior.always_visible {
                 self.hide();
             }
         }
@@ -255,6 +274,12 @@ impl MinimapWidget {
     fn update_size(&self) {
         let state = self.state.borrow();
         let config = self.config.borrow();
+
+        self.last_size_signature.set(layout_signature(
+            &state,
+            &self.output,
+            config.display.workspace_mode,
+        ));
 
         let (max_width, max_height) = self.get_monitor_caps();
         let (viewport_width, viewport_height) = monitor_logical_size(&self.monitor);
@@ -281,13 +306,27 @@ impl MinimapWidget {
     }
 
     fn refresh_geometry_and_draw(&self) {
-        if !self.overview_open.get() {
+        if !self.overview_open.get() || self.layout_structure_changed() {
             self.update_size();
         }
         // Keep click targets aligned with the current drawing even while the
         // layer's outer dimensions remain frozen during Overview.
         self.update_input_region();
         self.drawing_area.queue_draw();
+    }
+
+    /// Whether the arrangement changed since `update_size` last ran.
+    ///
+    /// During Overview the layer geometry is otherwise held stable, but the draw
+    /// path re-measures rows against the widget's *current* size. If a window
+    /// moves while Overview is open, the arrangement changes and the frozen size
+    /// no longer matches the content: rows get squeezed, or drop off the bottom
+    /// entirely when the row count grows. Re-measuring on a structural change
+    /// keeps the two in sync without reacting to the cell-size animation.
+    fn layout_structure_changed(&self) -> bool {
+        let state = self.state.borrow();
+        let mode = self.config.borrow().display.workspace_mode;
+        layout_signature(&state, &self.output, mode) != self.last_size_signature.get()
     }
 
     /// Get monitor-based caps for widget width and height.
@@ -605,6 +644,50 @@ fn workspace_window_hitboxes(
 /// any workspace that has at least one window, plus the focused one even if empty.
 /// This filters out Niri's trailing placeholder workspace (the always-present empty
 /// workspace users can scroll into to create a new one) unless the user is on it.
+/// Structural fingerprint of what the minimap will draw for `output`.
+///
+/// Deliberately covers only *structure* — which workspaces are shown and how
+/// their windows are arranged into columns — and never tile pixel sizes. Niri
+/// animates tile sizes while Overview opens and closes; those frames must not
+/// resize the layer surface (that is what `c9be22b` fixed). Moving a window is
+/// a different thing: it changes the arrangement, so the widget genuinely needs
+/// re-measuring, which is what this lets us detect.
+///
+/// A window *resize* during Overview is intentionally not covered, for the same
+/// reason tile sizes are excluded: it is indistinguishable from the animation.
+fn layout_signature(state: &MinimapState, output: &str, mode: WorkspaceMode) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+    let workspaces: Vec<&Workspace> = match mode {
+        WorkspaceMode::All => state
+            .workspaces_for_output(output)
+            .into_iter()
+            .filter(|ws| !ws.windows.is_empty() || ws.is_active)
+            .collect(),
+        WorkspaceMode::Current => state
+            .active_workspace_for_output(output)
+            .into_iter()
+            .collect(),
+    };
+
+    workspaces.len().hash(&mut hasher);
+    for ws in workspaces {
+        ws.id.hash(&mut hasher);
+        ws.is_active.hash(&mut hasher);
+
+        // HashMap iteration order is not stable, so sort before hashing.
+        let mut windows: Vec<(u64, usize, usize)> = ws
+            .windows
+            .values()
+            .map(|w| (w.id, w.column_index, w.window_index))
+            .collect();
+        windows.sort_unstable();
+        windows.hash(&mut hasher);
+    }
+
+    hasher.finish()
+}
+
 fn all_mode_rows<'a>(
     state: &'a MinimapState,
     output: &str,
@@ -1310,7 +1393,130 @@ fn rounded_rectangle(cr: &Context, x: f64, y: f64, width: f64, height: f64, radi
 
 #[cfg(test)]
 mod tests {
-    use super::{aspect_ratio_min_width, WindowHitbox};
+    use super::{aspect_ratio_min_width, layout_signature, WindowHitbox};
+    use crate::config::WorkspaceMode;
+    use crate::state::{MinimapState, Window, Workspace};
+
+    fn test_window(id: u64, column_index: usize, window_index: usize, size: (f64, f64)) -> Window {
+        Window {
+            id,
+            pos: Some((0.0, 0.0)),
+            size,
+            column_index,
+            window_index,
+            is_focused: false,
+            is_floating: false,
+            title: None,
+            app_id: None,
+        }
+    }
+
+    /// Two windows in one column on workspace 1, output "DP-1".
+    fn test_state() -> MinimapState {
+        let mut state = MinimapState::new();
+        let mut ws = Workspace {
+            id: 1,
+            idx: 0,
+            output: Some("DP-1".to_string()),
+            is_active: true,
+            ..Default::default()
+        };
+        ws.windows.insert(1, test_window(1, 0, 0, (100.0, 50.0)));
+        ws.windows.insert(2, test_window(2, 0, 1, (100.0, 50.0)));
+        state.workspaces.insert(1, ws);
+        state.active_workspace_id = Some(1);
+        state
+    }
+
+    #[test]
+    fn signature_ignores_tile_size_animation() {
+        let before = layout_signature(&test_state(), "DP-1", WorkspaceMode::All);
+
+        // Overview animates tile sizes without changing the arrangement.
+        let mut state = test_state();
+        let ws = state.workspaces.get_mut(&1).unwrap();
+        ws.windows.get_mut(&1).unwrap().size = (42.0, 21.0);
+        ws.windows.get_mut(&2).unwrap().size = (42.0, 21.0);
+
+        assert_eq!(
+            before,
+            layout_signature(&state, "DP-1", WorkspaceMode::All),
+            "cell-size animation must not trigger a resize"
+        );
+    }
+
+    #[test]
+    fn signature_changes_when_a_window_moves_to_another_column() {
+        let before = layout_signature(&test_state(), "DP-1", WorkspaceMode::All);
+
+        let mut state = test_state();
+        let win = state.workspaces.get_mut(&1).unwrap().windows.get_mut(&2).unwrap();
+        win.column_index = 1;
+        win.window_index = 0;
+
+        assert_ne!(
+            before,
+            layout_signature(&state, "DP-1", WorkspaceMode::All),
+            "moving a window between columns must re-measure the widget"
+        );
+    }
+
+    #[test]
+    fn signature_changes_when_a_workspace_row_appears() {
+        let before = layout_signature(&test_state(), "DP-1", WorkspaceMode::All);
+
+        // A window moved onto a second workspace: `all` mode grows by one row,
+        // which is the case that used to push rows off the frozen widget.
+        let mut state = test_state();
+        let mut ws2 = Workspace {
+            id: 2,
+            idx: 1,
+            output: Some("DP-1".to_string()),
+            is_active: false,
+            ..Default::default()
+        };
+        ws2.windows.insert(3, test_window(3, 0, 0, (100.0, 50.0)));
+        state.workspaces.insert(2, ws2);
+
+        assert_ne!(
+            before,
+            layout_signature(&state, "DP-1", WorkspaceMode::All),
+            "a new workspace row must re-measure the widget"
+        );
+    }
+
+    #[test]
+    fn signature_is_stable_across_hashmap_iteration_order() {
+        // Same arrangement, inserted in the opposite order.
+        let mut a = MinimapState::new();
+        let mut ws_a = Workspace {
+            id: 1,
+            idx: 0,
+            output: Some("DP-1".to_string()),
+            is_active: true,
+            ..Default::default()
+        };
+        ws_a.windows.insert(1, test_window(1, 0, 0, (100.0, 50.0)));
+        ws_a.windows.insert(2, test_window(2, 0, 1, (100.0, 50.0)));
+        a.workspaces.insert(1, ws_a);
+
+        let mut b = MinimapState::new();
+        let mut ws_b = Workspace {
+            id: 1,
+            idx: 0,
+            output: Some("DP-1".to_string()),
+            is_active: true,
+            ..Default::default()
+        };
+        ws_b.windows.insert(2, test_window(2, 0, 1, (100.0, 50.0)));
+        ws_b.windows.insert(1, test_window(1, 0, 0, (100.0, 50.0)));
+        b.workspaces.insert(1, ws_b);
+
+        assert_eq!(
+            layout_signature(&a, "DP-1", WorkspaceMode::All),
+            layout_signature(&b, "DP-1", WorkspaceMode::All)
+        );
+    }
 
     #[test]
     fn portrait_monitor_min_width_follows_aspect_ratio() {
