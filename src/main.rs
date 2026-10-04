@@ -1,9 +1,12 @@
+#![forbid(unsafe_code)]
+
 mod config;
 mod ipc;
 mod state;
 mod ui;
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -154,14 +157,9 @@ fn activate(app: &gtk4::Application, config: Rc<RefCell<Config>>) -> Result<()> 
     let config_reload_debounce = Duration::from_millis(CONFIG_RELOAD_DEBOUNCE_MS);
 
     glib::timeout_add_local(Duration::from_millis(50), move || {
-        // Process a batch of state updates
-        for _ in 0..10 {
-            if let Ok(update) = rx.try_recv() {
-                let list = minimaps_clone.widgets();
-                apply_state_update(&minimaps_clone.state, &list, update);
-            } else {
-                break;
-            }
+        for update in drain_state_updates(&rx) {
+            let list = minimaps_clone.widgets();
+            apply_state_update(&minimaps_clone.state, &list, update);
         }
 
         // Process config reload messages with debouncing
@@ -456,6 +454,51 @@ fn watch_config_file(
     Ok(())
 }
 
+/// Drain every pending update from the IPC channel and drop the redundant ones.
+///
+/// The IPC thread can produce updates far faster than the UI consumes them:
+/// any Wayland client may change its title (or app_id) thousands of times per
+/// second, and each change arrives as a `WindowChanged` carrying a cloned
+/// `Window`. Applying a fixed number per tick would let the channel grow
+/// without bound, so the whole backlog is taken here and collapsed with
+/// [`coalesce_state_updates`] before it is applied.
+fn drain_state_updates(rx: &mpsc::Receiver<StateUpdate>) -> Vec<StateUpdate> {
+    let mut updates = Vec::new();
+    while let Ok(update) = rx.try_recv() {
+        // A full snapshot supersedes everything queued before it.
+        if matches!(update, StateUpdate::FullState(_)) {
+            updates.clear();
+        }
+        updates.push(update);
+    }
+    coalesce_state_updates(updates)
+}
+
+/// Collapse a batch of updates so that only the most recent `WindowChanged`
+/// per window survives, keeping it at its original position so ordering
+/// relative to other updates (layouts, focus, closes) is unchanged.
+///
+/// Earlier `WindowChanged` events for the same window carry state that the
+/// later one fully replaces, so dropping them changes nothing about the final
+/// state. Everything else is kept as-is.
+fn coalesce_state_updates(updates: Vec<StateUpdate>) -> Vec<StateUpdate> {
+    let mut seen_windows = HashSet::new();
+    let mut kept = Vec::with_capacity(updates.len());
+
+    for update in updates.into_iter().rev() {
+        let keep = match &update {
+            StateUpdate::WindowChanged { window, .. } => seen_windows.insert(window.id),
+            _ => true,
+        };
+        if keep {
+            kept.push(update);
+        }
+    }
+
+    kept.reverse();
+    kept
+}
+
 /// Apply an update to the shared state, then redraw every minimap.
 ///
 /// The state is updated directly rather than through a widget: the minimap
@@ -518,13 +561,14 @@ fn apply_state_update(
                     }
 
                     // Insert into the correct workspace
-                    let workspace = state
-                        .workspaces
-                        .entry(ws_id)
-                        .or_insert_with(|| state::Workspace {
-                            id: ws_id,
-                            ..Default::default()
-                        });
+                    let workspace =
+                        state
+                            .workspaces
+                            .entry(ws_id)
+                            .or_insert_with(|| state::Workspace {
+                                id: ws_id,
+                                ..Default::default()
+                            });
                     is_new_window = !workspace.windows.contains_key(&window_id);
                     workspace.windows.insert(window_id, window);
                 } else {
@@ -651,6 +695,125 @@ fn apply_state_update(
 mod tests {
     use super::*;
 
+    use state::Window;
+
+    fn window_changed(id: u64, title: &str) -> StateUpdate {
+        StateUpdate::WindowChanged {
+            window: Window {
+                id,
+                pos: None,
+                size: (100.0, 100.0),
+                column_index: 0,
+                window_index: 0,
+                is_focused: false,
+                is_floating: false,
+                title: Some(title.to_string()),
+                app_id: None,
+            },
+            workspace_id: Some(1),
+        }
+    }
+
+    fn window_title(update: &StateUpdate) -> Option<&str> {
+        match update {
+            StateUpdate::WindowChanged { window, .. } => window.title.as_deref(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn test_coalesce_keeps_only_latest_change_per_window() {
+        // Simulates a client spamming title changes: 1000 updates for one window
+        let updates: Vec<StateUpdate> = (0..1000)
+            .map(|i| window_changed(7, &format!("title {}", i)))
+            .collect();
+
+        let kept = coalesce_state_updates(updates);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(window_title(&kept[0]), Some("title 999"));
+    }
+
+    #[test]
+    fn test_coalesce_preserves_order_and_other_updates() {
+        let updates = vec![
+            window_changed(1, "a1"),
+            StateUpdate::FocusChanged(Some(1)),
+            window_changed(2, "b1"),
+            window_changed(1, "a2"),
+            StateUpdate::WindowClosed(2),
+            StateUpdate::FocusChanged(Some(3)),
+        ];
+
+        let kept = coalesce_state_updates(updates);
+
+        // Window 1's first change is dropped; everything else stays in order.
+        assert_eq!(kept.len(), 5);
+        assert!(matches!(kept[0], StateUpdate::FocusChanged(Some(1))));
+        assert_eq!(window_title(&kept[1]), Some("b1"));
+        assert_eq!(window_title(&kept[2]), Some("a2"));
+        assert!(matches!(kept[3], StateUpdate::WindowClosed(2)));
+        assert!(matches!(kept[4], StateUpdate::FocusChanged(Some(3))));
+    }
+
+    #[test]
+    fn test_drain_full_state_supersedes_earlier_updates() {
+        let (tx, rx) = mpsc::channel();
+        tx.send(window_changed(1, "stale")).unwrap();
+        tx.send(StateUpdate::WindowClosed(9)).unwrap();
+        tx.send(StateUpdate::FullState(state::MinimapState::new()))
+            .unwrap();
+        tx.send(window_changed(2, "fresh")).unwrap();
+
+        let kept = drain_state_updates(&rx);
+
+        assert_eq!(kept.len(), 2);
+        assert!(matches!(kept[0], StateUpdate::FullState(_)));
+        assert_eq!(window_title(&kept[1]), Some("fresh"));
+        // Channel is fully drained
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_coalescing_keeps_overview_transitions() {
+        let kept = coalesce_state_updates(vec![
+            window_changed(1, "before"),
+            StateUpdate::OverviewChanged(true),
+            window_changed(1, "during"),
+            StateUpdate::OverviewChanged(false),
+        ]);
+        assert_eq!(kept.len(), 3);
+        assert!(matches!(kept[0], StateUpdate::OverviewChanged(true)));
+        assert_eq!(window_title(&kept[1]), Some("during"));
+        assert!(matches!(kept[2], StateUpdate::OverviewChanged(false)));
+    }
+
+    #[test]
+    fn test_reconnect_snapshot_updates_shared_state_without_monitors() {
+        let state = Rc::new(RefCell::new(MinimapState::new()));
+        let (tx, rx) = mpsc::channel();
+        tx.send(window_changed(9, "stale")).unwrap();
+        tx.send(StateUpdate::FullState(MinimapState::new()))
+            .unwrap();
+        tx.send(StateUpdate::OverviewChanged(true)).unwrap();
+        tx.send(window_changed(1, "fresh")).unwrap();
+        tx.send(StateUpdate::FocusChanged(Some(1))).unwrap();
+
+        for update in drain_state_updates(&rx) {
+            apply_state_update(&state, &[], update);
+        }
+
+        let state = state.borrow();
+        assert!(state.find_window(9).is_none());
+        assert_eq!(
+            state.find_window(1).unwrap().title.as_deref(),
+            Some("fresh")
+        );
+        assert_eq!(state.focused_window_id, Some(1));
+        assert!(state.overview_open);
+        assert!(rx.try_recv().is_err());
+    }
+
     #[test]
     fn test_config_reload_debounce_constant() {
         // Verify the debounce constant is set to a reasonable value
@@ -730,7 +893,12 @@ mod tests {
         assert_eq!(reload_count, 1);
     }
 
-    fn test_ipc_window_layout(col: usize, win_idx: usize, w: f64, h: f64) -> niri_ipc::WindowLayout {
+    fn test_ipc_window_layout(
+        col: usize,
+        win_idx: usize,
+        w: f64,
+        h: f64,
+    ) -> niri_ipc::WindowLayout {
         niri_ipc::WindowLayout {
             pos_in_scrolling_layout: Some((col, win_idx)),
             tile_size: (w, h),
@@ -838,7 +1006,13 @@ mod tests {
                 workspace_id: Some(1),
             },
         );
-        assert!(state.borrow().workspaces.get(&1).unwrap().windows.contains_key(&10));
+        assert!(state
+            .borrow()
+            .workspaces
+            .get(&1)
+            .unwrap()
+            .windows
+            .contains_key(&10));
 
         // Window moves to workspace 2
         apply_state_update(
@@ -849,8 +1023,20 @@ mod tests {
                 workspace_id: Some(2),
             },
         );
-        assert!(!state.borrow().workspaces.get(&1).unwrap().windows.contains_key(&10));
-        assert!(state.borrow().workspaces.get(&2).unwrap().windows.contains_key(&10));
+        assert!(!state
+            .borrow()
+            .workspaces
+            .get(&1)
+            .unwrap()
+            .windows
+            .contains_key(&10));
+        assert!(state
+            .borrow()
+            .workspaces
+            .get(&2)
+            .unwrap()
+            .windows
+            .contains_key(&10));
 
         // Window workspace becomes None (unmapped/removed)
         apply_state_update(
@@ -861,6 +1047,12 @@ mod tests {
                 workspace_id: None,
             },
         );
-        assert!(!state.borrow().workspaces.get(&2).unwrap().windows.contains_key(&10));
+        assert!(!state
+            .borrow()
+            .workspaces
+            .get(&2)
+            .unwrap()
+            .windows
+            .contains_key(&10));
     }
 }

@@ -77,7 +77,10 @@ cargo install --path .   # Install to ~/.cargo/bin
 
 ## Testing
 
-Currently no automated tests. Manual testing with Niri required.
+Run `cargo test --locked`, `cargo clippy --locked --all-targets --all-features -- -D warnings`,
+`cargo fmt --all -- --check`, and `cargo build --release --locked`. Linux CI checks
+these paths. Manual testing with Niri is still required for monitor hotplug,
+Overview, window clicks, and reconnect behavior.
 
 To test:
 1. Run `nirimap` in a terminal to see logs

@@ -816,6 +816,7 @@ fn compute_all_mode_geometry(
 }
 
 /// Compute widget dimensions based on state and config.
+#[allow(clippy::too_many_arguments)]
 fn compute_widget_dimensions(
     state: &MinimapState,
     display: &DisplayConfig,
